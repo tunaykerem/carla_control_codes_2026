@@ -1,0 +1,9 @@
+# CARLA Python API – install from the CARLA package (carla-*.egg / carla PyPI wheel)
+# pip install carla==0.9.14
+carla>=0.9.13
+
+# Keyboard / display support for manual_control.py
+pygame>=2.1.0
+
+# Numerical helpers
+numpy>=1.21.0

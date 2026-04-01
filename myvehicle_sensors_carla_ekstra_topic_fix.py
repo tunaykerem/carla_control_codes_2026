@@ -1054,12 +1054,17 @@ def main():
     # LiDAR için rendering ON olmalı
     settings.no_rendering_mode = False
     
-    # LiDAR tarama yoğunluğu için sabit adım (20 Hz)
-    settings.fixed_delta_seconds = 0.05
-    
     if args.sync:
+        # Senkron modda: 20 Hz sabit sim adımı + tick() döngüsü
         settings.synchronous_mode = True
-        print("[CARLA] Senkron mod: 20 Hz")
+        settings.fixed_delta_seconds = 0.05
+        print("[CARLA] Senkron mod: 20 Hz sabit adım")
+    else:
+        # Asenkron modda: CARLA gerçek zamanlı (wall-clock) koşsun
+        # fixed_delta_seconds = 0.0 → CARLA kendi frame süresini belirler
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = 0.0
+        print("[CARLA] Asenkron mod: gerçek zamanlı (fixed_delta_seconds=0)")
     
     world.apply_settings(settings)
 

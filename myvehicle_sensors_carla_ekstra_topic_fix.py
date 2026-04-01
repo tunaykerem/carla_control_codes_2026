@@ -182,6 +182,7 @@ class OusterLidar:
         bp.set_attribute('lower_fov',         '-45.0')
         bp.set_attribute('horizontal_fov',    '360')
         bp.set_attribute('atmosphere_attenuation_rate', '0.0')
+        bp.set_attribute('sensor_tick',       '0.05')   # 20 Hz callback
 
         tf = urdf_to_carla_transform(TRANSFORMS['ouster'])
         self.sensor = world.spawn_actor(
@@ -272,6 +273,7 @@ class VelodyneLidar:
         bp.set_attribute('lower_fov',         '-45.0')
         bp.set_attribute('horizontal_fov',    '360')
         bp.set_attribute('atmosphere_attenuation_rate', '0.0')
+        bp.set_attribute('sensor_tick',       '0.1')    # 10 Hz callback
 
         tf = urdf_to_carla_transform(TRANSFORMS['velodyne'])
         self.sensor = world.spawn_actor(
@@ -371,20 +373,21 @@ class ZedCamera:
         world = parent_actor.get_world()
         bp_lib = world.get_blueprint_library()
 
-        def make_camera_bp(tick):
+        def make_camera_bp(tick_offset):
             bp = bp_lib.find('sensor.camera.rgb')
             bp.set_attribute('image_size_x', str(self.IMAGE_W))
             bp.set_attribute('image_size_y', str(self.IMAGE_H))
             bp.set_attribute('fov',          str(self.FOV))
-            bp.set_attribute('sensor_tick',  tick)
+            bp.set_attribute('sensor_tick',  tick_offset)  # 20 Hz callback
             bp.set_attribute('enable_postprocess_effects', 'False')
             return bp
 
-        # Left at 0, Right at 0.02 to stagger the GPU render frames
-        self.sensor_left  = world.spawn_actor(make_camera_bp('0.0'), 
+        # Her iki kamera da 20 Hz; sağ kamera sol kameradan 10ms gecikmeli spawn
+        # (GPU render frame'lerini stagger etmek için)
+        self.sensor_left  = world.spawn_actor(make_camera_bp('0.05'), 
                                                urdf_to_carla_transform(TRANSFORMS['zed_left']),
                                                attach_to=parent_actor)
-        self.sensor_right = world.spawn_actor(make_camera_bp('0.02'), 
+        self.sensor_right = world.spawn_actor(make_camera_bp('0.06'), 
                                                urdf_to_carla_transform(TRANSFORMS['zed_right']),
                                                attach_to=parent_actor)
 
@@ -493,6 +496,7 @@ class IMUSensorPublisher:
 
         world = parent_actor.get_world()
         bp = world.get_blueprint_library().find('sensor.other.imu')
+        bp.set_attribute('sensor_tick', '0.005')  # 200 Hz callback
 
         tf1 = urdf_to_carla_transform(TRANSFORMS['imu_1'])
         tf2 = urdf_to_carla_transform(TRANSFORMS['imu_2'])
@@ -604,6 +608,7 @@ class GNSSSensorPublisher:
 
         world = parent_actor.get_world()
         bp = world.get_blueprint_library().find('sensor.other.gnss')
+        bp.set_attribute('sensor_tick', '0.1')  # 10 Hz callback
 
         tf_front = urdf_to_carla_transform(TRANSFORMS['gnss_front_right'])
         tf_rear  = urdf_to_carla_transform(TRANSFORMS['gnss_rear_right'])

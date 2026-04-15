@@ -207,6 +207,7 @@ class OusterLidar:
                     PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
                     PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
                     PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='ring', offset=16, datatype=PointField.UINT8, count=1),
                 ]
 
         weak = weakref.ref(self)
@@ -219,23 +220,45 @@ class OusterLidar:
             return
 
         import numpy as np
-        pts = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)
-        # 1m filtre – vektörize, sqrt yok
-        mask = pts[:, 0]**2 + pts[:, 1]**2 + pts[:, 2]**2 >= OusterLidar.MIN_RANGE_SQ
-        pts = pts[mask]
-        # CARLA→ROS: Y eksenini ters çevir (CARLA Y=sağ → ROS Y=sol)
-        pts[:, 1] *= -1.0
 
+        NUM_CHANNELS = 64
+
+        # Parse raw data: CARLA provides [x, y, z, intensity] per point, ordered by channel
+        # points_per_second=655360, rotation_frequency=20 → 32768 pts/frame ÷ 64 ch = 512/ch
+        pts_raw = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
+        n_total = len(pts_raw)
+        if n_total < NUM_CHANNELS:
+            return
+
+        # CARLA→ROS: Y axis flip (CARLA Y=sağ → ROS Y=sol)
+        pts_raw[:, 1] *= -1.0
+
+        # CARLA eşit dağıtır: her kanalda n_per_ch nokta var
+        n_per_ch = n_total // NUM_CHANNELS
+        used = n_per_ch * NUM_CHANNELS  # tam katını al
+
+        # Kanal-major → azimuth-major: reshape + transpose (neredeyse sıfır maliyet)
+        # (64, 512, 4) → transpose → (512, 64, 4) → flatten → (32768, 4)
+        organized = np.ascontiguousarray(
+            pts_raw[:used].reshape(NUM_CHANNELS, n_per_ch, 4).transpose(1, 0, 2)
+        ).reshape(used, 4)
+
+        # 20 byte/point: XYZI(16) + ring(1) + pad(3)
+        buf = np.zeros((used, 20), dtype=np.uint8)
+        buf[:, :16] = organized.view(np.uint8).reshape(used, 16)
+        buf[:, 16]  = np.tile(np.arange(NUM_CHANNELS, dtype=np.uint8), n_per_ch)
+
+        # Organized PointCloud2
         msg = PointCloud2()
         msg.header = make_header(OusterLidar.FRAME_ID, _carla_stamp(data))
-        msg.height = 1
-        msg.width  = len(pts)
-        msg.is_dense = True
+        msg.height = n_per_ch           # rows = azimuth positions
+        msg.width  = NUM_CHANNELS       # cols = channels (64)
+        msg.is_dense = True             # tüm hücreler dolu
         msg.is_bigendian = False
-        msg.point_step = 16
-        msg.row_step   = msg.point_step * msg.width
+        msg.point_step = 20
+        msg.row_step   = 20 * NUM_CHANNELS
         msg.fields = OusterLidar._FIELDS
-        msg.data = pts.tobytes()
+        msg.data = buf.tobytes()
         self._pub.publish(msg)
 
     def destroy(self):
@@ -298,6 +321,7 @@ class VelodyneLidar:
                     PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
                     PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
                     PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='ring', offset=16, datatype=PointField.UINT8, count=1),
                 ]
 
         weak = weakref.ref(self)
@@ -309,23 +333,39 @@ class VelodyneLidar:
         if not self or self._pub is None:
             return
 
-        # CARLA→ROS: Y eksenini ters çevir (CARLA Y=sağ → ROS Y=sol)
         import numpy as np
-        pts = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
-        pts[:, 1] *= -1.0
-        n_points = len(pts)
-        raw = pts.tobytes()
+
+        NUM_CHANNELS = 16
+
+        pts_raw = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
+        n_total = len(pts_raw)
+        if n_total < NUM_CHANNELS:
+            return
+
+        # CARLA→ROS: Y axis flip (CARLA Y=sağ → ROS Y=sol)
+        pts_raw[:, 1] *= -1.0
+
+        n_per_ch = n_total // NUM_CHANNELS
+        used = n_per_ch * NUM_CHANNELS
+
+        organized = np.ascontiguousarray(
+            pts_raw[:used].reshape(NUM_CHANNELS, n_per_ch, 4).transpose(1, 0, 2)
+        ).reshape(used, 4)
+
+        buf = np.zeros((used, 20), dtype=np.uint8)
+        buf[:, :16] = organized.view(np.uint8).reshape(used, 16)
+        buf[:, 16]  = np.tile(np.arange(NUM_CHANNELS, dtype=np.uint8), n_per_ch)
 
         msg = PointCloud2()
         msg.header = make_header(VelodyneLidar.FRAME_ID, _carla_stamp(data))
-        msg.height = 1
-        msg.width  = n_points
+        msg.height = n_per_ch
+        msg.width  = NUM_CHANNELS
         msg.is_dense = True
         msg.is_bigendian = False
-        msg.point_step = 16
-        msg.row_step   = 16 * n_points
+        msg.point_step = 20
+        msg.row_step   = 20 * NUM_CHANNELS
         msg.fields = VelodyneLidar._FIELDS
-        msg.data = raw
+        msg.data = buf.tobytes()
         self._pub.publish(msg)
 
     def destroy(self):

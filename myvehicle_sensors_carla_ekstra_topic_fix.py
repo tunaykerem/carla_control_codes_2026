@@ -9,12 +9,12 @@ Araç üzerindeki sensörlerin tamamını doğru TF konumlarıyla CARLA'ya ekler
 ve ROS 2 topic'lerine yayınlar.
 
 Sensörler (URDF'den alınan TF'ler):
-  - Ouster OS0-64 LiDAR       : /ouster/points             (xyz: 0.85, 0.0, 1.10 | rpy: 0,0,π)
+  - Ouster OS0-64 LiDAR        : /ouster/points             (xyz: 0.85, 0.0, 1.10 | rpy: 0,0,π)
   - Velodyne LiDAR             : /velodyne/points           (xyz: 0.8, 0.0, 1.25  | rpy: 0,0,0)
-  - ZED Camera (sol/sag)       : /zed/left/image_raw,
-                                 /zed/right/image_raw       (Ouster'a göre ofset)
+  - ZED Camera (sol/sag)       :     /zed/left/image_raw,
+                                     /zed/right/image_raw       (Ouster'a göre ofset)
   - ZED Camera Info            : /zed/left/camera_info,
-                                 /zed/right/camera_info
+                                     /zed/right/camera_info
   - IMU 1                      : /imu/imu1/data             (xyz: 0.40,-0.12,0.80)
   - IMU 2                      : /imu/imu2/data             (xyz: 0.40, 0.00,0.80)
   - GNSS Ön Sağ                : /gnss/front_right/fix      (xyz: 1.35,-0.45,0.30)
@@ -342,11 +342,9 @@ class ZedCamera:
     """
     ZED 2 stereo kamera – Fixed high-Hz version.
     """
-    IMAGE_W = 640
-    IMAGE_H = 360
+    IMAGE_W = 1280
+    IMAGE_H = 720
     FOV     = 90.0
-    GAMMA   = 2.2
-    BRIGHTNESS_SCALE = 3.5
 
     def __init__(self, parent_actor, ros_node=None):
         self._parent = parent_actor
@@ -362,8 +360,6 @@ class ZedCamera:
         self._ci_left  = None
         self._ci_right = None
 
-        # Optimization: Try to use cv_bridge for 2ms build times. 
-        # If not found, it falls back to a 'slightly better' manual method.
         try:
             from cv_bridge import CvBridge
             self.bridge = CvBridge()
@@ -379,11 +375,10 @@ class ZedCamera:
             bp.set_attribute('image_size_y', str(self.IMAGE_H))
             bp.set_attribute('fov',          str(self.FOV))
             bp.set_attribute('sensor_tick',  tick_offset)  # 20 Hz callback
-            bp.set_attribute('enable_postprocess_effects', 'False')
+            bp.set_attribute('enable_postprocess_effects', 'True')
+            # exposure_compensation CARLA 0.10'da hata verdiği için kullanılmıyor
             return bp
 
-        # Her iki kamera da 20 Hz; sağ kamera sol kameradan 10ms gecikmeli spawn
-        # (GPU render frame'lerini stagger etmek için)
         self.sensor_left  = world.spawn_actor(make_camera_bp('0.05'), 
                                                urdf_to_carla_transform(TRANSFORMS['zed_left']),
                                                attach_to=parent_actor)
@@ -394,7 +389,7 @@ class ZedCamera:
         if ros_node is not None:
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
             qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
-            self._pub_left_img   = ros_node.create_publisher(Image,      '/zed/left/image_raw',   qos)
+            self._pub_left_img   = ros_node.create_publisher(Image,      '/zed/left/image_raw',    qos)
             self._pub_left_info  = ros_node.create_publisher(CameraInfo, '/zed/left/camera_info', qos)
             self._pub_right_img  = ros_node.create_publisher(Image,      '/zed/right/image_raw',  qos)
             self._pub_right_info = ros_node.create_publisher(CameraInfo, '/zed/right/camera_info', qos)
@@ -426,28 +421,23 @@ class ZedCamera:
         lock = self._busy_left if side == 'left' else self._busy_right
         
         if not lock.acquire(blocking=False):
-            return # Busy processing previous frame? Drop this one.
+            return 
 
-        # Optimization: Pass raw_data memoryview directly to avoid the 'bytes()' copy
         _CAM_POOL.submit(ZedCamera._publish, self, img_data.raw_data, _carla_stamp(img_data), img_data.width, img_data.height, side, lock)
 
     @staticmethod
     def _publish(self, raw_data, stamp, w, h, side, lock):
         try:
             import numpy as np
-            # Zero-copy view of the buffer
             array = np.frombuffer(raw_data, dtype=np.uint8).reshape((h, w, 4))
             
-            # Optimized brightness (Single pass)
-            # We work on a copy here to avoid messing with CARLA's internal buffer
             out = array.copy()
-            out[:, :, :3] = np.clip(out[:, :, :3].astype(np.uint16) * 3, 0, 255).astype(np.uint8)
+            # Parlaklığı simülasyon seviyesine getirmek için orijinal kodunuzdaki gibi 3.5 kat artırıyoruz
+            out[:, :, :3] = np.clip(out[:, :, :3].astype(np.float32) * 3.5, 0, 255).astype(np.uint8)
 
             if self.bridge:
-                # FAST PATH: Uses C++ to build the message (~1-2ms)
                 img_msg = self.bridge.cv2_to_imgmsg(out, encoding="bgra8")
             else:
-                # SLOW PATH: Manual (but still slightly faster than your previous setup)
                 img_msg = Image()
                 img_msg.height, img_msg.width = h, w
                 img_msg.encoding = 'bgra8'

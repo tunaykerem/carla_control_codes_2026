@@ -11,13 +11,13 @@ ve ROS 2 topic'lerine yayınlar.
 Sensörler (URDF'den alınan TF'ler):
   - Ouster OS0-64 LiDAR        : /ouster/points             (xyz: 0.85, 0.0, 1.10 | rpy: 0,0,π)
   - Velodyne LiDAR             : /velodyne/points           (xyz: 0.8, 0.0, 1.25  | rpy: 0,0,0)
-  - ZED Camera (sol/sag)       :     /zed/left/image_raw,
+  - ZED Camera (sol/sag)       :     /zed/zed_node/left/image_rect_color,
                                      /zed/right/image_raw       (Ouster'a göre ofset)
   - ZED Camera Info            : /zed/left/camera_info,
                                      /zed/right/camera_info
-  - IMU 1                      : /imu/imu1/data             (xyz: 0.40,-0.12,0.80)
+  - IMU 1 (SBG)                : /sbg/ros/imu/data          (xyz: 0.40,-0.12,0.80)
   - IMU 2                      : /imu/imu2/data             (xyz: 0.40, 0.00,0.80)
-  - GNSS Ön Sağ                : /gnss/front_right/fix      (xyz: 1.35,-0.45,0.30)
+  - GNSS (SBG NavSatFix)       : /sbg/ros/nav_sat_fix       (xyz: 1.35,-0.45,0.30)
   - GNSS Arka Sağ              : /gnss/rear_right/fix       (xyz: 0.00,-0.45,0.30)
 
 Kullanım:
@@ -429,7 +429,7 @@ class ZedCamera:
         if ros_node is not None:
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
             qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
-            self._pub_left_img   = ros_node.create_publisher(Image,      '/zed/left/image_raw',    qos)
+            self._pub_left_img   = ros_node.create_publisher(Image,      '/zed/zed_node/left/image_rect_color',    qos)
             self._pub_left_info  = ros_node.create_publisher(CameraInfo, '/zed/left/camera_info', qos)
             self._pub_right_img  = ros_node.create_publisher(Image,      '/zed/right/image_raw',  qos)
             self._pub_right_info = ros_node.create_publisher(CameraInfo, '/zed/right/camera_info', qos)
@@ -513,8 +513,8 @@ class IMUSensorPublisher:
     """
     İki adet IMU sensörü.
     Topics:
-      /imu/imu1/data   (sensor_msgs/Imu)
-      /imu/imu2/data   (sensor_msgs/Imu)
+      /sbg/ros/imu/data  (sensor_msgs/Imu)  ← gerçek araç SBG driver topic'i
+      /imu/imu2/data     (sensor_msgs/Imu)  ← CARLA-only ikincil IMU
     """
     def __init__(self, parent_actor, ros_node=None):
         self._parent = parent_actor
@@ -547,7 +547,7 @@ class IMUSensorPublisher:
                 reliability=ReliabilityPolicy.BEST_EFFORT,
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1)
-            self._pub1 = ros_node.create_publisher(Imu, '/imu/imu1/data', qos)
+            self._pub1 = ros_node.create_publisher(Imu, '/sbg/ros/imu/data', qos)
             self._pub2 = ros_node.create_publisher(Imu, '/imu/imu2/data', qos)
 
         # HUD için ilave: imu1 değerleri saklanır
@@ -556,7 +556,7 @@ class IMUSensorPublisher:
         self.compass       = 0.0
 
         weak = weakref.ref(self)
-        self.sensor1.listen(lambda d: IMUSensorPublisher._cb(weak, d, '/imu/imu1/data', 'imu_link_1', 1))
+        self.sensor1.listen(lambda d: IMUSensorPublisher._cb(weak, d, '/sbg/ros/imu/data', 'imu_link', 1))
         self.sensor2.listen(lambda d: IMUSensorPublisher._cb(weak, d, '/imu/imu2/data', 'imu_link_2', 2))
 
     @staticmethod
@@ -619,10 +619,10 @@ class IMUSensorPublisher:
 
 class GNSSSensorPublisher:
     """
-    Ön sağ ve arka sağ GNSS sensörleri.
+    GNSS sensörleri.
     Topics:
-      /gnss/front_right/fix   (sensor_msgs/NavSatFix)
-      /gnss/rear_right/fix    (sensor_msgs/NavSatFix)
+      /sbg/ros/nav_sat_fix    (sensor_msgs/NavSatFix)  ← gerçek araç SBG driver topic'i
+      /gnss/rear_right/fix    (sensor_msgs/NavSatFix)  ← CARLA-only ikincil GNSS
     """
     def __init__(self, parent_actor, ros_node=None):
         self._parent = parent_actor
@@ -659,11 +659,11 @@ class GNSSSensorPublisher:
                 reliability=ReliabilityPolicy.BEST_EFFORT,
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1)
-            self._pub_front = ros_node.create_publisher(NavSatFix, '/gnss/front_right/fix', qos)
+            self._pub_front = ros_node.create_publisher(NavSatFix, '/sbg/ros/nav_sat_fix', qos)
             self._pub_rear  = ros_node.create_publisher(NavSatFix, '/gnss/rear_right/fix',  qos)
 
         weak = weakref.ref(self)
-        self.sensor_front.listen(lambda d: GNSSSensorPublisher._cb(weak, d, 'gnss_front_right', 'front'))
+        self.sensor_front.listen(lambda d: GNSSSensorPublisher._cb(weak, d, 'imu_link', 'front'))
         self.sensor_rear.listen( lambda d: GNSSSensorPublisher._cb(weak, d, 'gnss_rear_right',  'rear'))
 
     @staticmethod
@@ -721,9 +721,9 @@ def broadcast_static_tfs(node):
         'ouster':            'ouster',
         'zed_left':          'zed_left_camera_optical_frame',
         'zed_right':         'zed_right_camera_optical_frame',
-        'imu_1':             'imu_link_1',
+        'imu_1':             'imu_link',           # gerçek araç: imu_link
         'imu_2':             'imu_link_2',
-        'gnss_front_right':  'gnss_front_right',
+        'gnss_front_right':  'imu_link',            # gerçek araç: SBG GNSS de imu_link frame kullanıyor
         'gnss_rear_right':   'gnss_rear_right',
     }
 
@@ -1147,13 +1147,13 @@ def main():
     print("-" * 65)
     print(f"{'/ouster/points':<45} Ouster OS0-64 LiDAR")
     print(f"{'/velodyne/points':<45} Velodyne LiDAR")
-    print(f"{'/zed/left/image_raw':<45} ZED 2 Kamera Sol")
+    print(f"{'/zed/zed_node/left/image_rect_color':<45} ZED 2 Kamera Sol")
     print(f"{'/zed/left/camera_info':<45} ZED 2 CameraInfo Sol")
     print(f"{'/zed/right/image_raw':<45} ZED 2 Kamera Sağ")
     print(f"{'/zed/right/camera_info':<45} ZED 2 CameraInfo Sağ")
-    print(f"{'/imu/imu1/data':<45} IMU 1 (xyz: 0.40,-0.12,0.80)")
+    print(f"{'/sbg/ros/imu/data':<45} IMU 1/SBG (xyz: 0.40,-0.12,0.80)")
     print(f"{'/imu/imu2/data':<45} IMU 2 (xyz: 0.40, 0.00,0.80)")
-    print(f"{'/gnss/front_right/fix':<45} GNSS Ön Sağ (xyz: 1.35,-0.45,0.30)")
+    print(f"{'/sbg/ros/nav_sat_fix':<45} GNSS/SBG NavSatFix (xyz: 1.35,-0.45,0.30)")
     print(f"{'/gnss/rear_right/fix':<45} GNSS Arka Sağ (xyz: 0.00,-0.45,0.30)")
     print("-" * 65)
 

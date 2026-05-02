@@ -243,6 +243,24 @@ class OusterLidar:
             pts_raw[:used].reshape(NUM_CHANNELS, n_per_ch, 4).transpose(1, 0, 2)
         ).reshape(used, 4)
 
+        # ── Self-Hit Bounding-Box Filtresi ─────────────────────────────
+        # CARLA'da LiDAR aracın kaputunu/tavanını okur → gürültü (kırmızı)
+        # noktalar üretir. Araç bounding box'ı içindeki noktaları NaN ile
+        # dolduruyoruz — organized grid korunur, PCL NaN'ları atlar.
+        # MyVehicle boyutları ~4.5m×1.8m×1.5m
+        # Noktalar ouster-lokal koordinatlarında (sensör: x=0.85, y=0.0, z=1.10)
+        # base_link bbox: (-0.5,-1.2,0.0)→(4.0,1.2,1.8)
+        # ouster-lokal:   (-1.35,-1.2,-1.10)→(3.15,1.2,0.70)
+        BBOX_MIN = np.array([-1.35, -1.2, -1.10], dtype=np.float32)
+        BBOX_MAX = np.array([ 3.15,  1.2,  0.70], dtype=np.float32)
+
+        self_hit = (
+            (organized[:, 0] > BBOX_MIN[0]) & (organized[:, 0] < BBOX_MAX[0]) &
+            (organized[:, 1] > BBOX_MIN[1]) & (organized[:, 1] < BBOX_MAX[1]) &
+            (organized[:, 2] > BBOX_MIN[2]) & (organized[:, 2] < BBOX_MAX[2])
+        )
+        organized[self_hit] = np.nan  # NaN → is_dense=False ile PCL atlar
+
         # 20 byte/point: XYZI(16) + ring(1) + pad(3)
         buf = np.zeros((used, 20), dtype=np.uint8)
         buf[:, :16] = organized.view(np.uint8).reshape(used, 16)
@@ -253,7 +271,7 @@ class OusterLidar:
         msg.header = make_header(OusterLidar.FRAME_ID, _carla_stamp(data))
         msg.height = n_per_ch           # rows = azimuth positions
         msg.width  = NUM_CHANNELS       # cols = channels (64)
-        msg.is_dense = True             # tüm hücreler dolu
+        msg.is_dense = False            # NaN noktalar var → is_dense=False
         msg.is_bigendian = False
         msg.point_step = 20
         msg.row_step   = 20 * NUM_CHANNELS

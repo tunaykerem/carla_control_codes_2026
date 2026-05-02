@@ -203,11 +203,16 @@ class OusterLidar:
 
             if OusterLidar._FIELDS is None:
                 OusterLidar._FIELDS = [
-                    PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
-                    PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
-                    PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
-                    PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
-                    PointField(name='ring', offset=16, datatype=PointField.UINT8, count=1),
+                    PointField(name='x',            offset=0,  datatype=PointField.FLOAT32, count=1),
+                    PointField(name='y',            offset=4,  datatype=PointField.FLOAT32, count=1),
+                    PointField(name='z',            offset=8,  datatype=PointField.FLOAT32, count=1),
+                    # offset 12: 4 byte padding (PCL_ADD_POINT4D homogeneous coord)
+                    PointField(name='intensity',    offset=16, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='t',            offset=20, datatype=PointField.UINT32,  count=1),
+                    PointField(name='reflectivity', offset=24, datatype=PointField.UINT16,  count=1),
+                    PointField(name='ring',         offset=26, datatype=PointField.UINT16,  count=1),
+                    PointField(name='ambient',      offset=28, datatype=PointField.UINT16,  count=1),
+                    PointField(name='range',        offset=32, datatype=PointField.UINT32,  count=1),
                 ]
 
         weak = weakref.ref(self)
@@ -261,10 +266,37 @@ class OusterLidar:
         )
         organized[self_hit] = np.nan  # NaN → is_dense=False ile PCL atlar
 
-        # 20 byte/point: XYZI(16) + ring(1) + pad(3)
-        buf = np.zeros((used, 20), dtype=np.uint8)
-        buf[:, :16] = organized.view(np.uint8).reshape(used, 16)
-        buf[:, 16]  = np.tile(np.arange(NUM_CHANNELS, dtype=np.uint8), n_per_ch)
+        # ── 48 byte/point buffer (gerçek Ouster OS0-64 formatı) ────────
+        POINT_STEP = 48
+        buf = np.zeros((used, POINT_STEP), dtype=np.uint8)
+
+        # x, y, z → offset 0, 4, 8  (12 byte, float32)
+        buf[:, 0:12] = organized[:, :3].view(np.uint8).reshape(used, 12)
+
+        # offset 12-15: padding (PCL_ADD_POINT4D 4th coord = 0, zaten sıfır)
+
+        # intensity → offset 16 (float32)
+        buf[:, 16:20] = organized[:, 3:4].view(np.uint8).reshape(used, 4)
+
+        # t → offset 20 (uint32, simülasyonda 0 bırakılır)
+        # → zaten sıfır
+
+        # reflectivity → offset 24 (uint16, simülasyonda 0)
+        # → zaten sıfır
+
+        # ring → offset 26 (uint16) — kanal numarası
+        ring_vals = np.tile(np.arange(NUM_CHANNELS, dtype=np.uint16), n_per_ch)
+        buf[:, 26:28] = ring_vals.view(np.uint8).reshape(used, 2)
+
+        # ambient → offset 28 (uint16, simülasyonda 0)
+        # → zaten sıfır
+
+        # range → offset 32 (uint32, mesafe mm olarak hesaplanır)
+        distances_m = np.sqrt(organized[:, 0]**2 + organized[:, 1]**2 + organized[:, 2]**2)
+        range_mm = (distances_m * 1000).astype(np.uint32)
+        buf[:, 32:36] = range_mm.view(np.uint8).reshape(used, 4)
+
+        # offset 36-47: padding → zaten sıfır
 
         # Organized PointCloud2
         msg = PointCloud2()
@@ -273,8 +305,8 @@ class OusterLidar:
         msg.width  = NUM_CHANNELS       # cols = channels (64)
         msg.is_dense = False            # NaN noktalar var → is_dense=False
         msg.is_bigendian = False
-        msg.point_step = 20
-        msg.row_step   = 20 * NUM_CHANNELS
+        msg.point_step = POINT_STEP     # 48
+        msg.row_step   = POINT_STEP * NUM_CHANNELS
         msg.fields = OusterLidar._FIELDS
         msg.data = buf.tobytes()
         self._pub.publish(msg)

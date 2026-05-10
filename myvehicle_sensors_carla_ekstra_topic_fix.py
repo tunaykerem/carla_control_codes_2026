@@ -139,25 +139,33 @@ def make_header(frame_id: str, stamp=None):
 
 def _carla_stamp(data):
     """
-    CARLA sensor verisinden ROS2 timestamp üret.
-    data.timestamp: simülasyon saniyesi (float).
-    Bu yöntem wallclock/simclock uyumsuzluğundan kaynaklanan
-    görünür gecikmeyi ortadan kaldırır.
+    Wall-clock (gerçek saat) timestamp üretir.
+    CARLA sim-time kullanmak RViz'de gecikme yaratır çünkü:
+      - Sim-time: sec=45  (simülasyon başlangıcından itibaren)
+      - Wall-clock: sec=1778421000  (Unix epoch)
+    RViz TF araması wall-clock kullanır → sim-time stamp'li veriler
+    "geçmişten" gelmiş gibi görünür → görünür gecikme.
     """
     from builtin_interfaces.msg import Time
+    now = time.time()
     t = Time()
-    t.sec     = int(data.timestamp)
-    t.nanosec = int((data.timestamp - t.sec) * 1e9)
+    t.sec     = int(now)
+    t.nanosec = int((now - t.sec) * 1e9)
     return t
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ouster OS0-64 LiDAR Sensörü
+# Ouster OS0-64 LiDAR Sensörü — Zero-Delay Direct Publish
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OusterLidar:
     """
-    Ouster OS0-64 – hızlı mod
+    Ouster OS0-64 – sıfır gecikme modu (zero-delay direct publish)
     Topic: /ouster/points  (sensor_msgs/PointCloud2)
+
+    Her CARLA callback'inde gelen slice'ı anında işleyip yayınlar.
+    Biriktirme yapmaz → sıfır ek gecikme.
+    RViz'de kısmi taramalar arasındaki boşluklar için:
+      RViz → PointCloud2 display → Decay Time = 0.1 s  ayarlayın.
     """
     TOPIC = '/ouster/points'
     FRAME_ID = 'ouster'
@@ -196,9 +204,9 @@ class OusterLidar:
         if ros_node is not None:
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
             qos = QoSProfile(
-                reliability=ReliabilityPolicy.RELIABLE,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
                 history=HistoryPolicy.KEEP_LAST,
-                depth=5)
+                depth=1)
             self._pub = ros_node.create_publisher(PointCloud2, self.TOPIC, qos)
 
             if OusterLidar._FIELDS is None:
@@ -229,7 +237,6 @@ class OusterLidar:
         NUM_CHANNELS = 64
 
         # Parse raw data: CARLA provides [x, y, z, intensity] per point, ordered by channel
-        # points_per_second=655360, rotation_frequency=20 → 32768 pts/frame ÷ 64 ch = 512/ch
         pts_raw = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
         n_total = len(pts_raw)
         if n_total < NUM_CHANNELS:
@@ -242,20 +249,12 @@ class OusterLidar:
         n_per_ch = n_total // NUM_CHANNELS
         used = n_per_ch * NUM_CHANNELS  # tam katını al
 
-        # Kanal-major → azimuth-major: reshape + transpose (neredeyse sıfır maliyet)
-        # (64, 512, 4) → transpose → (512, 64, 4) → flatten → (32768, 4)
+        # Kanal-major → azimuth-major: reshape + transpose
         organized = np.ascontiguousarray(
             pts_raw[:used].reshape(NUM_CHANNELS, n_per_ch, 4).transpose(1, 0, 2)
         ).reshape(used, 4)
 
         # ── Self-Hit Bounding-Box Filtresi ─────────────────────────────
-        # CARLA'da LiDAR aracın kaputunu/tavanını okur → gürültü (kırmızı)
-        # noktalar üretir. Araç bounding box'ı içindeki noktaları NaN ile
-        # dolduruyoruz — organized grid korunur, PCL NaN'ları atlar.
-        # MyVehicle boyutları ~4.5m×1.8m×1.5m
-        # Noktalar ouster-lokal koordinatlarında (sensör: x=0.85, y=0.0, z=1.10)
-        # base_link bbox: (-0.5,-1.2,0.0)→(4.0,1.2,1.8)
-        # ouster-lokal:   (-1.35,-1.2,-1.10)→(3.15,1.2,0.70)
         BBOX_MIN = np.array([-1.35, -1.2, -1.10], dtype=np.float32)
         BBOX_MAX = np.array([ 3.15,  1.2,  0.70], dtype=np.float32)
 
@@ -264,7 +263,7 @@ class OusterLidar:
             (organized[:, 1] > BBOX_MIN[1]) & (organized[:, 1] < BBOX_MAX[1]) &
             (organized[:, 2] > BBOX_MIN[2]) & (organized[:, 2] < BBOX_MAX[2])
         )
-        organized[self_hit] = np.nan  # NaN → is_dense=False ile PCL atlar
+        organized[self_hit] = np.nan
 
         # ── 48 byte/point buffer (gerçek Ouster OS0-64 formatı) ────────
         POINT_STEP = 48
@@ -273,37 +272,24 @@ class OusterLidar:
         # x, y, z → offset 0, 4, 8  (12 byte, float32)
         buf[:, 0:12] = organized[:, :3].view(np.uint8).reshape(used, 12)
 
-        # offset 12-15: padding (PCL_ADD_POINT4D 4th coord = 0, zaten sıfır)
-
         # intensity → offset 16 (float32)
         buf[:, 16:20] = organized[:, 3:4].view(np.uint8).reshape(used, 4)
-
-        # t → offset 20 (uint32, simülasyonda 0 bırakılır)
-        # → zaten sıfır
-
-        # reflectivity → offset 24 (uint16, simülasyonda 0)
-        # → zaten sıfır
 
         # ring → offset 26 (uint16) — kanal numarası
         ring_vals = np.tile(np.arange(NUM_CHANNELS, dtype=np.uint16), n_per_ch)
         buf[:, 26:28] = ring_vals.view(np.uint8).reshape(used, 2)
-
-        # ambient → offset 28 (uint16, simülasyonda 0)
-        # → zaten sıfır
 
         # range → offset 32 (uint32, mesafe mm olarak hesaplanır)
         distances_m = np.sqrt(organized[:, 0]**2 + organized[:, 1]**2 + organized[:, 2]**2)
         range_mm = (distances_m * 1000).astype(np.uint32)
         buf[:, 32:36] = range_mm.view(np.uint8).reshape(used, 4)
 
-        # offset 36-47: padding → zaten sıfır
-
-        # Organized PointCloud2
+        # ── PointCloud2 mesajı — anında yayınla ────────────────────────
         msg = PointCloud2()
         msg.header = make_header(OusterLidar.FRAME_ID, _carla_stamp(data))
         msg.height = n_per_ch           # rows = azimuth positions
         msg.width  = NUM_CHANNELS       # cols = channels (64)
-        msg.is_dense = False            # NaN noktalar var → is_dense=False
+        msg.is_dense = False
         msg.is_bigendian = False
         msg.point_step = POINT_STEP     # 48
         msg.row_step   = POINT_STEP * NUM_CHANNELS

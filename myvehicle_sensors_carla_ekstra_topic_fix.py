@@ -154,22 +154,23 @@ def _carla_stamp(data):
     return t
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ouster OS0-64 LiDAR Sensörü — Zero-Delay Direct Publish
+# Ouster OS0-64 LiDAR Sensörü — Rotation-Completion Trigger
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OusterLidar:
     """
-    Ouster OS0-64 – sıfır gecikme modu (zero-delay direct publish)
+    Ouster OS0-64 – Zero-Delay Direct Publish (NaN-safe)
     Topic: /ouster/points  (sensor_msgs/PointCloud2)
 
-    Her CARLA callback'inde gelen slice'ı anında işleyip yayınlar.
-    Biriktirme yapmaz → sıfır ek gecikme.
-    RViz'de kısmi taramalar arasındaki boşluklar için:
-      RViz → PointCloud2 display → Decay Time = 0.1 s  ayarlayın.
+    CARLA'da sensor_tick=0.05 ve rotation_frequency=20 ayarıyla her callback
+    tam bir 360° tarama teslim eder — gerçek donanımın kısmi slice'larına karşı.
+    Bu nedenle azimuth wraparound tespiti kullanılmaz; her callback doğrudan
+    yayınlanır. Self-hit filtresi NaN atadığı için tüm azimuth hesaplamaları
+    NaN-safe fonksiyonlar kullanır.
     """
     TOPIC = '/ouster/points'
     FRAME_ID = 'ouster'
-    MIN_RANGE_SQ = 0.1  # 0.1m² (mesafe karesi olarak)
+    NUM_CHANNELS = 64
 
     # PointField'lar sabit – her callback'te yeniden oluşturulmasın
     _FIELDS = None
@@ -182,9 +183,9 @@ class OusterLidar:
 
         world = parent_actor.get_world()
         bp = world.get_blueprint_library().find('sensor.lidar.ray_cast')
-        bp.set_attribute('channels',          '64')      # 64→32 hız için
+        bp.set_attribute('channels',          '64')
         bp.set_attribute('range',             '50')
-        bp.set_attribute('points_per_second', '655360')   # minimal
+        bp.set_attribute('points_per_second', '655360')
         bp.set_attribute('rotation_frequency','20')
         bp.set_attribute('upper_fov',         '22.5')
         bp.set_attribute('lower_fov',         '-45.0')
@@ -234,30 +235,27 @@ class OusterLidar:
 
         import numpy as np
 
-        NUM_CHANNELS = 64
+        NUM_CH = OusterLidar.NUM_CHANNELS
 
-        # Parse raw data: CARLA provides [x, y, z, intensity] per point, ordered by channel
+        # Parse raw data: CARLA provides [x, y, z, intensity] per point
         pts_raw = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
         n_total = len(pts_raw)
-        if n_total < NUM_CHANNELS:
+        if n_total < NUM_CH:
             return
 
         # CARLA→ROS: Y axis flip (CARLA Y=sağ → ROS Y=sol)
         pts_raw[:, 1] *= -1.0
 
-        # CARLA eşit dağıtır: her kanalda n_per_ch nokta var
-        n_per_ch = n_total // NUM_CHANNELS
-        used = n_per_ch * NUM_CHANNELS  # tam katını al
-
         # Kanal-major → azimuth-major: reshape + transpose
+        n_per_ch = n_total // NUM_CH
+        used = n_per_ch * NUM_CH
         organized = np.ascontiguousarray(
-            pts_raw[:used].reshape(NUM_CHANNELS, n_per_ch, 4).transpose(1, 0, 2)
+            pts_raw[:used].reshape(NUM_CH, n_per_ch, 4).transpose(1, 0, 2)
         ).reshape(used, 4)
 
         # ── Self-Hit Bounding-Box Filtresi ─────────────────────────────
         BBOX_MIN = np.array([-1.35, -1.2, -1.10], dtype=np.float32)
         BBOX_MAX = np.array([ 3.15,  1.2,  0.70], dtype=np.float32)
-
         self_hit = (
             (organized[:, 0] > BBOX_MIN[0]) & (organized[:, 0] < BBOX_MAX[0]) &
             (organized[:, 1] > BBOX_MIN[1]) & (organized[:, 1] < BBOX_MAX[1]) &
@@ -276,11 +274,14 @@ class OusterLidar:
         buf[:, 16:20] = organized[:, 3:4].view(np.uint8).reshape(used, 4)
 
         # ring → offset 26 (uint16) — kanal numarası
-        ring_vals = np.tile(np.arange(NUM_CHANNELS, dtype=np.uint16), n_per_ch)
+        ring_vals = np.tile(np.arange(NUM_CH, dtype=np.uint16), n_per_ch)
         buf[:, 26:28] = ring_vals.view(np.uint8).reshape(used, 2)
 
         # range → offset 32 (uint32, mesafe mm olarak hesaplanır)
-        distances_m = np.sqrt(organized[:, 0]**2 + organized[:, 1]**2 + organized[:, 2]**2)
+        # nansum ile NaN noktalar için 0 mesafe yazılır (is_dense=False olduğundan geçerli)
+        distances_m = np.sqrt(
+            np.nansum(organized[:, :3] ** 2, axis=1)
+        )
         range_mm = (distances_m * 1000).astype(np.uint32)
         buf[:, 32:36] = range_mm.view(np.uint8).reshape(used, 4)
 
@@ -288,11 +289,11 @@ class OusterLidar:
         msg = PointCloud2()
         msg.header = make_header(OusterLidar.FRAME_ID, _carla_stamp(data))
         msg.height = n_per_ch           # rows = azimuth positions
-        msg.width  = NUM_CHANNELS       # cols = channels (64)
-        msg.is_dense = False
+        msg.width  = NUM_CH             # cols = channels (64)
+        msg.is_dense = False            # NaN noktalar mevcut
         msg.is_bigendian = False
         msg.point_step = POINT_STEP     # 48
-        msg.row_step   = POINT_STEP * NUM_CHANNELS
+        msg.row_step   = POINT_STEP * NUM_CH
         msg.fields = OusterLidar._FIELDS
         msg.data = buf.tobytes()
         self._pub.publish(msg)

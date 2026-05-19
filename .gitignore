@@ -20,3 +20,6 @@ carla_sensor_bridge/log/
 
 # carla_reader_clang standalone build
 carla_sensor_bridge/carla_reader_clang/build/
+
+lidar_latency_test.py
+lidar_stream_check.py

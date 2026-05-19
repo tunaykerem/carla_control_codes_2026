@@ -48,6 +48,7 @@ Aralarındaki iletişim **TCP** (port 9090) üzerinden custom binary protokol il
 ```
 carla_control_codes_2026/
 │
+├── setup_env.sh                            # 🔧 Ortam değişkeni kurulum scripti
 ├── myvehicle_control.py                    # Araç spawn + klavye kontrol (Pygame)
 ├── myvehicle_sensors_carla_ekstra_topic_fix.py  # Python sensör publisher (--no-ouster desteği)
 ├── clang-libc++.cmake                      # Clang toolchain dosyası
@@ -104,8 +105,42 @@ carla_control_codes_2026/
 - **Python 3.10+** — carla, pygame, numpy, rclpy, cv_bridge
 - **Clang 14+** — carla_reader_clang build için
 - **GCC 11+** — ros2_publisher_gcc build için (ROS 2 ile gelir)
+- **CARLA_ROOT** ortam değişkeni — CarlaUE5 kaynak dizinine işaret etmeli (bkz. [Ortam Kurulumu](#ortam-kurulumu))
+
+## Ortam Kurulumu
+
+Bu proje **makineye özel hardcoded yol içermez**. Build öncesinde `CARLA_ROOT` ortam değişkenini ayarlamanız gerekir. Üç yöntemden birini kullanabilirsiniz:
+
+### Yöntem 1: setup_env.sh (Önerilen)
+
+```bash
+# Otomatik algılama (bilinen dizinleri tarar)
+source setup_env.sh
+
+# Veya yolu kendiniz belirtin
+source setup_env.sh /path/to/CarlaUE5
+```
+
+### Yöntem 2: Manuel export
+
+```bash
+export CARLA_ROOT=/path/to/CarlaUE5
+
+# Kalıcı yapmak için:
+echo 'export CARLA_ROOT=/path/to/CarlaUE5' >> ~/.bashrc
+```
+
+### Yöntem 3: CMake'e doğrudan geçirme
+
+```bash
+cmake -DCARLA_ROOT=/path/to/CarlaUE5 ..
+```
+
+> ⚠️ `CARLA_ROOT` tanımlı değilse CMake açıklayıcı bir hata mesajı gösterir ve durur.
 
 ## Build
+
+> **Ön koşul:** Yukarıdaki [Ortam Kurulumu](#ortam-kurulumu) adımını tamamlamış olun.
 
 ### 1. carla_reader_clang (Standalone CMake — Clang)
 

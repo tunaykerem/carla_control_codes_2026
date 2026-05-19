@@ -31,10 +31,43 @@ else()
 endif()
 
 # ── CARLA C++ SDK ───────────────────────────────────────────────────────────
+# CARLA_ROOT can be set via:
+#   1. Environment variable:  export CARLA_ROOT=/path/to/CarlaUE5
+#   2. CMake command line:    cmake -DCARLA_ROOT=/path/to/CarlaUE5 ..
 set(CARLA_ROOT "$ENV{CARLA_ROOT}" CACHE PATH "Path to CARLA source tree (CarlaUE5)")
 if(NOT CARLA_ROOT OR "${CARLA_ROOT}" STREQUAL "")
-  set(CARLA_ROOT "/home/tunay/itu_sct_gae/karla_zimulazyon/CarlaUE5")
+  message(FATAL_ERROR
+    "\n"
+    "══════════════════════════════════════════════════════════════════\n"
+    "  CARLA_ROOT is not set!\n"
+    "\n"
+    "  Please set the CARLA_ROOT environment variable to the path\n"
+    "  of your CarlaUE5 source tree before configuring.\n"
+    "\n"
+    "  Example:\n"
+    "    export CARLA_ROOT=/home/\$USER/CarlaUE5\n"
+    "    cmake ..\n"
+    "\n"
+    "  Or pass it directly to CMake:\n"
+    "    cmake -DCARLA_ROOT=/home/\$USER/CarlaUE5 ..\n"
+    "══════════════════════════════════════════════════════════════════\n"
+  )
 endif()
+
+# Validate that the directory actually exists
+if(NOT EXISTS "${CARLA_ROOT}/LibCarla/source")
+  message(FATAL_ERROR
+    "\n"
+    "══════════════════════════════════════════════════════════════════\n"
+    "  CARLA_ROOT points to: ${CARLA_ROOT}\n"
+    "  but '${CARLA_ROOT}/LibCarla/source' does not exist.\n"
+    "\n"
+    "  Please check that the path is correct and CARLA is built.\n"
+    "══════════════════════════════════════════════════════════════════\n"
+  )
+endif()
+
+message(STATUS "Using CARLA_ROOT: ${CARLA_ROOT}")
 
 set(CARLA_LIBCARLA_INCLUDE "${CARLA_ROOT}/LibCarla/source")
 set(CARLA_LIBCARLA_LIB     "${CARLA_ROOT}/Build/LibCarla")

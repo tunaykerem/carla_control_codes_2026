@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+install/
+log/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary/debug files
+*.csv
+calistirma_kilavuzu.md
+
+# carla_sensor_bridge build outputs
+carla_sensor_bridge/build/
+carla_sensor_bridge/install/
+carla_sensor_bridge/log/
+
+# carla_reader_clang standalone build
+carla_sensor_bridge/carla_reader_clang/build/

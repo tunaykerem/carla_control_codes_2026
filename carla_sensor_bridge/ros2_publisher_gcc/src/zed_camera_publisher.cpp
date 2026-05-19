@@ -1,0 +1,1 @@
+// stub — zed camera publisher

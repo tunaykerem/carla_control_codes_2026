@@ -1,0 +1,1 @@
+// stub — velodyne lidar publisher

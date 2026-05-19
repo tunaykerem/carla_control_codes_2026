@@ -38,13 +38,15 @@ import threading
 import random
 import signal
 from concurrent.futures import ThreadPoolExecutor
-
+import numpy as np
 # Global thread pool – LiDAR/IMU/GNSS callback'leri buradan çalışır
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='sensor')
 
 # Kameralara ayrılmış thread pool – LiDAR callback'lerinin kamerayı bloklamasını önler
 # Sol + sağ kamera aynı anda yayınlayabilsin diye en az 2 worker gerekli; 4 bıraktık
 _CAM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='cam')
+
+
 
 # ── opsiyonel ROS 2 ──────────────────────────────────────────────────────────
 try:
@@ -55,7 +57,7 @@ try:
     from geometry_msgs.msg import TransformStamped
     from std_msgs.msg import Header
     import tf2_ros
-    import numpy as np
+    # import numpy as np
     ROS_AVAILABLE = True
     try:
         from gae_msgs.msg import GaeControlCmd
@@ -159,39 +161,83 @@ def _carla_stamp(data):
 
 class OusterLidar:
     """
-    Ouster OS0-64 – Zero-Delay Direct Publish (NaN-safe)
+    Ouster OS0-64 – Sector Accumulation, per-callback publish
     Topic: /ouster/points  (sensor_msgs/PointCloud2)
-
-    CARLA'da sensor_tick=0.05 ve rotation_frequency=20 ayarıyla her callback
-    tam bir 360° tarama teslim eder — gerçek donanımın kısmi slice'larına karşı.
-    Bu nedenle azimuth wraparound tespiti kullanılmaz; her callback doğrudan
-    yayınlanır. Self-hit filtresi NaN atadığı için tüm azimuth hesaplamaları
-    NaN-safe fonksiyonlar kullanır.
+ 
+    CARLA 0.10, sensor_tick/rotation_frequency parametrelerine bakılmaksızın
+    kısmi slice'lar teslim eder. Bu yüzden:
+      1. Her callback gelen slice'ı yalnızca ilgili sektör slot'una yazar (O(slice)).
+      2. Her callback'te güncel (taze) sektörler birleştirilip yayınlanır.
+         İlk ~12 callback'ten sonra (~0.6s) tam 360° kapsam elde edilir.
+    Bu yaklaşım:
+      - Timer thread gerektirmez → GIL çekişmesi sıfır
+      - Wraparound tespiti yok → ortalama azimuth kayması sorunu yok
+      - Eski/düşmüş sektörleri CARLA zaman damgasıyla filtreler (STALE_S=0.20s)
+      - Yapılandırılmış dtype ile doğrudan alan ataması → .view() hataları yok
     """
-    TOPIC = '/ouster/points'
-    FRAME_ID = 'ouster'
+    TOPIC        = '/ouster/points'
+    FRAME_ID     = 'ouster'
     NUM_CHANNELS = 64
-
+    NUM_SECTORS  = 12        # 12 sektör × 30° = 360°
+    STALE_S      = 0.20      # 200ms = ~4 dönüş (20Hz'de 50ms/dönüş) — dropped callback'lere tolerans
+ 
     # PointField'lar sabit – her callback'te yeniden oluşturulmasın
     _FIELDS = None
-
+ 
+    # Ouster OS0-64 tam 48-byte nokta düzeni (structured dtype)
+    # Doğrudan alan ataması → non-contiguous .view() hatası yok
+    _OUSTER_DTYPE = np.dtype([
+        ('x',            '<f4'),      # offset  0
+        ('y',            '<f4'),      # offset  4
+        ('z',            '<f4'),      # offset  8
+        ('_pad0',        '<f4'),      # offset 12  (PCL w / homogeneous)
+        ('intensity',    '<f4'),      # offset 16
+        ('t',            '<u4'),      # offset 20
+        ('reflectivity', '<u2'),      # offset 24
+        ('ring',         '<u2'),      # offset 26
+        ('ambient',      '<u2'),      # offset 28
+        ('_pad1',        '<u2'),      # offset 30  (alignment)
+        ('range',        '<u4'),      # offset 32
+        ('_pad2',        '<u4', 3),   # offset 36  (→ 48 bytes total)
+    ]) if ROS_AVAILABLE else None
+ 
     def __init__(self, parent_actor, ros_node=None):
         self._parent = parent_actor
         self._node = ros_node
         self.sensor = None
         self._pub = None
+        self._busy = threading.Lock()   # async publish: meşgulse callback'i atla
+
+        # ── Sektör birikme durumu ──────────────────────────────────────
+        self._sector_grid  = {}   # {0..11 : np.ndarray (N, 4)}
+        self._sector_stamp = {}   # {0..11 : float}  — CARLA timestamp
 
         world = parent_actor.get_world()
         bp = world.get_blueprint_library().find('sensor.lidar.ray_cast')
         bp.set_attribute('channels',          '64')
         bp.set_attribute('range',             '50')
-        bp.set_attribute('points_per_second', '655360')
+        bp.set_attribute('points_per_second', '1310720')
         bp.set_attribute('rotation_frequency','20')
-        bp.set_attribute('upper_fov',         '22.5')
+        bp.set_attribute('upper_fov',         '45.0')
         bp.set_attribute('lower_fov',         '-45.0')
         bp.set_attribute('horizontal_fov',    '360')
         bp.set_attribute('atmosphere_attenuation_rate', '0.0')
         bp.set_attribute('sensor_tick',       '0.05')   # 20 Hz callback
+
+        # FIX 1: CARLA defaults drop ~45% of points before ray-casting.
+        # Must be explicitly disabled, otherwise nearly half the cloud is
+        # silently missing regardless of points_per_second.
+        bp.set_attribute('dropoff_general_rate',    '0.0')  # default=0.45 → 45% loss!
+
+        # FIX 2: Intensity-based drop-off is also active by default.
+        # dropoff_zero_intensity=0.4 means 40% of zero-intensity points are dropped,
+        # and dropoff_intensity_limit=0.8 creates a linear drop ramp below that threshold.
+        # Disable both so the full cloud reaches the callback.
+        bp.set_attribute('dropoff_zero_intensity',  '0.0')  # default=0.40
+        bp.set_attribute('dropoff_intensity_limit', '1.0')  # default=0.80; 1.0 → no drop
+
+        # Explicit noise suppression (default is already 0.0, but stated clearly)
+        bp.set_attribute('noise_stddev',            '0.03')
 
         tf = urdf_to_carla_transform(TRANSFORMS['ouster'])
         self.sensor = world.spawn_actor(
@@ -225,83 +271,228 @@ class OusterLidar:
                 ]
 
         weak = weakref.ref(self)
-        self.sensor.listen(lambda data: OusterLidar._callback(weak, data))
+        self.sensor.listen(lambda data: OusterLidar._dispatch(weak, data))
 
     @staticmethod
-    def _callback(weak, data):
+    def _dispatch(weak, data):
+        """CARLA callback → async: meşgulse atla, değilse _POOL'a gönder."""
         self = weak()
         if not self or self._pub is None:
             return
+        if not self._busy.acquire(blocking=False):
+            OusterLidar._prof_dropped += 1
+            return   # önceki publish hâlâ devam ediyor → bu slice'ı atla
+        _POOL.submit(OusterLidar._callback, weak, data, self._busy)
+ 
+    # ── Profiling state (sınıf düzeyinde, tüm instance'lar paylaşır) ──
+    _prof_count      = 0
+    _prof_last_time  = 0.0
+    _prof_interval   = []   # callback arası süre (ms)
+    _prof_parse      = []   # parse + Y-flip + organize (ms)
+    _prof_sector     = []   # azimuth hesap + sektör yazma (ms)
+    _prof_concat     = []   # taze sektör toplama + concat (ms)
+    _prof_struct     = []   # 48-byte struct build (ms)
+    _prof_tobytes    = []   # cloud.tobytes() süresi (ms)
+    _prof_pub_only   = []   # sadece publish() süresi (ms)
+    _prof_total      = []   # toplam callback süresi (ms)
+    _prof_n_points   = []   # yayınlanan toplam nokta sayısı
+    _prof_n_sectors  = []   # taze sektör sayısı
+    _prof_dropped    = 0    # meşgul olduğu için atlanan callback sayısı
+    _PROF_EVERY      = 50   # her N callback'te rapor bas
 
-        import numpy as np
-
-        NUM_CH = OusterLidar.NUM_CHANNELS
-
-        # Parse raw data: CARLA provides [x, y, z, intensity] per point
-        pts_raw = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
-        n_total = len(pts_raw)
-        if n_total < NUM_CH:
+    @staticmethod
+    def _callback(weak, data, lock):
+        self = weak()
+        if not self or self._pub is None:
+            lock.release()
             return
 
-        # CARLA→ROS: Y axis flip (CARLA Y=sağ → ROS Y=sol)
-        pts_raw[:, 1] *= -1.0
+        try:
+            t_start = time.time()
 
-        # Kanal-major → azimuth-major: reshape + transpose
-        n_per_ch = n_total // NUM_CH
-        used = n_per_ch * NUM_CH
-        organized = np.ascontiguousarray(
-            pts_raw[:used].reshape(NUM_CH, n_per_ch, 4).transpose(1, 0, 2)
-        ).reshape(used, 4)
+            # ── Callback arası süre ölç ──
+            if OusterLidar._prof_last_time > 0:
+                OusterLidar._prof_interval.append((t_start - OusterLidar._prof_last_time) * 1000.0)
+            OusterLidar._prof_last_time = t_start
 
-        # ── Self-Hit Bounding-Box Filtresi ─────────────────────────────
-        BBOX_MIN = np.array([-1.35, -1.2, -1.10], dtype=np.float32)
-        BBOX_MAX = np.array([ 3.15,  1.2,  0.70], dtype=np.float32)
-        self_hit = (
-            (organized[:, 0] > BBOX_MIN[0]) & (organized[:, 0] < BBOX_MAX[0]) &
-            (organized[:, 1] > BBOX_MIN[1]) & (organized[:, 1] < BBOX_MAX[1]) &
-            (organized[:, 2] > BBOX_MIN[2]) & (organized[:, 2] < BBOX_MAX[2])
-        )
-        organized[self_hit] = np.nan
+            NUM_CH  = OusterLidar.NUM_CHANNELS
+            N_SEC   = OusterLidar.NUM_SECTORS
+            STALE_S = OusterLidar.STALE_S
 
-        # ── 48 byte/point buffer (gerçek Ouster OS0-64 formatı) ────────
-        POINT_STEP = 48
-        buf = np.zeros((used, POINT_STEP), dtype=np.uint8)
+            # ── 1. Parse ──────────────────────────────────────────────────
+            t0 = time.time()
+            pts_raw = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
+            n_total = len(pts_raw)
+            if n_total < NUM_CH:
+                return
 
-        # x, y, z → offset 0, 4, 8  (12 byte, float32)
-        buf[:, 0:12] = organized[:, :3].view(np.uint8).reshape(used, 12)
+            pts_raw[:, 1] *= -1.0   # CARLA→ROS Y-flip
 
-        # intensity → offset 16 (float32)
-        buf[:, 16:20] = organized[:, 3:4].view(np.uint8).reshape(used, 4)
+            n_per_ch = n_total // NUM_CH
+            used     = n_per_ch * NUM_CH
 
-        # ring → offset 26 (uint16) — kanal numarası
-        ring_vals = np.tile(np.arange(NUM_CH, dtype=np.uint16), n_per_ch)
-        buf[:, 26:28] = ring_vals.view(np.uint8).reshape(used, 2)
+            # Kanal-major → azimuth-major; ascontiguousarray → C-contiguous
+            organized = np.ascontiguousarray(
+                pts_raw[:used].reshape(NUM_CH, n_per_ch, 4).transpose(1, 0, 2)
+            ).reshape(used, 4)
+            t1 = time.time()
 
-        # range → offset 32 (uint32, mesafe mm olarak hesaplanır)
-        # nansum ile NaN noktalar için 0 mesafe yazılır (is_dense=False olduğundan geçerli)
-        distances_m = np.sqrt(
-            np.nansum(organized[:, :3] ** 2, axis=1)
-        )
-        range_mm = (distances_m * 1000).astype(np.uint32)
-        buf[:, 32:36] = range_mm.view(np.uint8).reshape(used, 4)
+            # ── 2. Self-hit filter: XYZ only, preserve intensity ──────────
+            # (devre dışı)
 
-        # ── PointCloud2 mesajı — anında yayınla ────────────────────────
-        msg = PointCloud2()
-        msg.header = make_header(OusterLidar.FRAME_ID, _carla_stamp(data))
-        msg.height = n_per_ch           # rows = azimuth positions
-        msg.width  = NUM_CH             # cols = channels (64)
-        msg.is_dense = False            # NaN noktalar mevcut
-        msg.is_bigendian = False
-        msg.point_step = POINT_STEP     # 48
-        msg.row_step   = POINT_STEP * NUM_CH
-        msg.fields = OusterLidar._FIELDS
-        msg.data = buf.tobytes()
-        self._pub.publish(msg)
+            # ── 3. Ortalama azimuth → sektör indeksi ──────────────────────
+            t2 = time.time()
+            mean_az = float(np.nanmean(np.arctan2(organized[:, 1], organized[:, 0])))
+            if np.isnan(mean_az):
+                return
 
+            now     = data.timestamp
+            sec_idx = int((mean_az + np.pi) / (2.0 * np.pi) * N_SEC) % N_SEC
+
+            # ── 4. Sektör slot'unu yaz ────────────────────────────────────
+            self._sector_grid[sec_idx]  = organized
+            self._sector_stamp[sec_idx] = now
+            t3 = time.time()
+
+            # ── 5. Güncel sektörleri topla ────────────────────────────────
+            oldest_allowed = now - STALE_S
+            fresh_sectors = [
+                (idx, pts) for idx, pts in self._sector_grid.items()
+                if self._sector_stamp.get(idx, -999.0) >= oldest_allowed
+            ]
+
+            if not fresh_sectors:
+                return
+
+            pts_list  = []
+            ring_list = []
+            for _idx, pts in fresh_sectors:
+                n_az_i = len(pts) // NUM_CH
+                used_i = n_az_i * NUM_CH
+                pts_list.append(pts[:used_i])
+                ring_list.append(
+                    np.tile(np.arange(NUM_CH, dtype=np.uint16), n_az_i)
+                )
+
+            full_pts  = np.concatenate(pts_list,  axis=0)
+            full_ring = np.concatenate(ring_list, axis=0)
+
+            n_total_pts   = len(full_pts)
+            n_per_ch_full = n_total_pts // NUM_CH
+            if n_per_ch_full == 0:
+                return
+            used_full = n_per_ch_full * NUM_CH
+            full_pts  = full_pts[:used_full]
+            full_ring = full_ring[:used_full]
+            t4 = time.time()
+
+            # ── 6. Yapılandırılmış 48-byte cloud (zero-copy) ──────────────
+            # bytearray pre-alloc → numpy view → doğrudan msg.data ataması
+            # tobytes() çağrısı YOK → GIL çekişmesi ve 140ms kopyalama ortadan kalkar
+            buf   = bytearray(used_full * 48)
+            cloud = np.ndarray(shape=(used_full,),
+                               dtype=OusterLidar._OUSTER_DTYPE,
+                               buffer=buf)
+
+            cloud['x']         = full_pts[:, 0]
+            cloud['y']         = full_pts[:, 1]
+            cloud['z']         = full_pts[:, 2]
+            cloud['intensity'] = full_pts[:, 3]
+            cloud['ring']      = full_ring
+
+            refl = np.nan_to_num(full_pts[:, 3], nan=0.0)
+            cloud['reflectivity'] = np.clip(refl * 257.0, 0, 65535).astype(np.uint16)
+
+            cloud['range'] = (
+                np.sqrt(np.nansum(full_pts[:, :3] ** 2, axis=1)) * 1000
+            ).astype(np.uint32)
+
+            PERIOD_NS = np.uint32(50_000_000)
+            cloud['t'] = (
+                np.arange(n_per_ch_full, dtype=np.uint32).repeat(NUM_CH)
+                * (PERIOD_NS // np.uint32(n_per_ch_full))
+            )
+            t5 = time.time()
+
+            # ── 7a. msg oluştur (tobytes YOK — doğrudan bytearray) ────────
+            msg             = PointCloud2()
+            msg.header      = make_header(OusterLidar.FRAME_ID, _carla_stamp(data))
+            msg.height      = n_per_ch_full
+            msg.width       = NUM_CH
+            msg.is_dense    = False
+            msg.is_bigendian = False
+            msg.point_step  = 48
+            msg.row_step    = 48 * NUM_CH
+            msg.fields      = OusterLidar._FIELDS
+            msg.data        = buf          # ← zero-copy: bytearray doğrudan atanır
+            t6 = time.time()
+
+            # ── 7b. publish ───────────────────────────────────────────────
+            self._pub.publish(msg)
+            t7 = time.time()
+
+            # ── PROFILING ─────────────────────────────────────────────────
+            OusterLidar._prof_parse.append((t1 - t0) * 1000.0)
+            OusterLidar._prof_sector.append((t3 - t2) * 1000.0)
+            OusterLidar._prof_concat.append((t4 - t3) * 1000.0)
+            OusterLidar._prof_struct.append((t5 - t4) * 1000.0)
+            OusterLidar._prof_tobytes.append((t6 - t5) * 1000.0)
+            OusterLidar._prof_pub_only.append((t7 - t6) * 1000.0)
+            OusterLidar._prof_total.append((t7 - t_start) * 1000.0)
+            OusterLidar._prof_n_points.append(used_full)
+            OusterLidar._prof_n_sectors.append(len(fresh_sectors))
+            OusterLidar._prof_count += 1
+
+            if OusterLidar._prof_count % OusterLidar._PROF_EVERY == 0:
+                def _avg(lst):
+                    return sum(lst) / len(lst) if lst else 0.0
+                def _max(lst):
+                    return max(lst) if lst else 0.0
+
+                interval = OusterLidar._prof_interval
+                avg_hz   = 1000.0 / _avg(interval) if _avg(interval) > 0 else 0.0
+                msg_kb   = _avg(OusterLidar._prof_n_points) * 48 / 1024.0
+
+                print(f"\n{'='*70}")
+                print(f"  OUSTER PROFILING — Son {OusterLidar._PROF_EVERY} callback")
+                print(f"{'='*70}")
+                print(f"  Callback frekansı   : {avg_hz:6.1f} Hz  (aralık: ort={_avg(interval):6.1f} ms, max={_max(interval):6.1f} ms)")
+                print(f"  ──────────────────────────────────────────────────────")
+                print(f"  1. Parse+Organize   : ort={_avg(OusterLidar._prof_parse):6.2f} ms, max={_max(OusterLidar._prof_parse):6.2f} ms")
+                print(f"  2. Sektör hesaplama : ort={_avg(OusterLidar._prof_sector):6.2f} ms, max={_max(OusterLidar._prof_sector):6.2f} ms")
+                print(f"  3. Concat+Ring      : ort={_avg(OusterLidar._prof_concat):6.2f} ms, max={_max(OusterLidar._prof_concat):6.2f} ms")
+                print(f"  4. 48B Struct build : ort={_avg(OusterLidar._prof_struct):6.2f} ms, max={_max(OusterLidar._prof_struct):6.2f} ms")
+                print(f"  5a. msg build       : ort={_avg(OusterLidar._prof_tobytes):6.2f} ms, max={_max(OusterLidar._prof_tobytes):6.2f} ms")
+                print(f"  5b. publish()       : ort={_avg(OusterLidar._prof_pub_only):6.2f} ms, max={_max(OusterLidar._prof_pub_only):6.2f} ms")
+                print(f"  ──────────────────────────────────────────────────────")
+                print(f"  TOPLAM              : ort={_avg(OusterLidar._prof_total):6.2f} ms, max={_max(OusterLidar._prof_total):6.2f} ms")
+                print(f"  Mesaj boyutu        : {msg_kb:.0f} KB  ({_avg(OusterLidar._prof_n_points):,.0f} nokta × 48B)")
+                print(f"  Taze sektör         : {_avg(OusterLidar._prof_n_sectors):.1f} / {OusterLidar.NUM_SECTORS}")
+                print(f"  Atlanan (meşgul)    : {OusterLidar._prof_dropped}")
+                print(f"  Bütçe (20Hz=50ms)   : {'✅ OK' if _avg(OusterLidar._prof_total) < 50 else '❌ AŞILDI!'}")
+                print(f"{'='*70}\n")
+
+                OusterLidar._prof_interval.clear()
+                OusterLidar._prof_parse.clear()
+                OusterLidar._prof_sector.clear()
+                OusterLidar._prof_concat.clear()
+                OusterLidar._prof_struct.clear()
+                OusterLidar._prof_tobytes.clear()
+                OusterLidar._prof_pub_only.clear()
+                OusterLidar._prof_total.clear()
+                OusterLidar._prof_n_points.clear()
+                OusterLidar._prof_n_sectors.clear()
+                OusterLidar._prof_dropped = 0
+        finally:
+            lock.release()
+ 
     def destroy(self):
         if self.sensor and self.sensor.is_alive:
             self.sensor.stop()
             self.sensor.destroy()
+ 
+
+ 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,7 +561,7 @@ class VelodyneLidar:
         if not self or self._pub is None:
             return
 
-        import numpy as np
+        #import numpy as np
 
         NUM_CHANNELS = 16
 
@@ -505,7 +696,7 @@ class ZedCamera:
     @staticmethod
     def _publish(self, raw_data, stamp, w, h, side, lock):
         try:
-            import numpy as np
+            # import numpy as np
             array = np.frombuffer(raw_data, dtype=np.uint8).reshape((h, w, 4))
             
             out = array.copy()
@@ -978,16 +1169,20 @@ class VehicleController:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SensorManager:
-    def __init__(self, world, vehicle, ros_node=None):
+    def __init__(self, world, vehicle, ros_node=None, no_ouster=False):
         self.vehicle = vehicle
         self._sensors = []
         node = ros_node
 
         print("[SensorManager] Sensörler ekleniyor...")
 
-        self.ouster   = OusterLidar(vehicle, node)
-        self._sensors.append(self.ouster)
-        print("  ✓ Ouster OS0-64 LiDAR")
+        if no_ouster:
+            self.ouster = None
+            print("  ⏭ Ouster OS0-64 LiDAR → ATLANADI (--no-ouster, C++ bridge kullanılacak)")
+        else:
+            self.ouster   = OusterLidar(vehicle, node)
+            self._sensors.append(self.ouster)
+            print("  ✓ Ouster OS0-64 LiDAR")
 
         self.velodyne = VelodyneLidar(vehicle, node)
         self._sensors.append(self.velodyne)
@@ -1096,6 +1291,8 @@ def main():
     ap.add_argument('--ros',   action='store_true', help='ROS 2 topic yayını etkinleştir')
     ap.add_argument('--attach-only', action='store_true',
                     help='Yeni araç spawn etme; sadece mevcut araca sensör ekle')
+    ap.add_argument('--no-ouster', action='store_true',
+                    help='Ouster LiDAR sensörünü spawn etme (C++ bridge kullanıldığında)')
     args = ap.parse_args()
 
     # ── ROS 2 kurulumu ─────────────────────────────────────────────────────
@@ -1143,7 +1340,7 @@ def main():
     # ── Araç ve sensörler ──────────────────────────────────────────────────
     vehicle    = find_or_spawn_vehicle(world, args.filter,
                                        attach_only=getattr(args, 'attach_only', False))
-    sensor_mgr = SensorManager(world, vehicle, ros_node)
+    sensor_mgr = SensorManager(world, vehicle, ros_node, no_ouster=args.no_ouster)
     vehicle_ctrl = VehicleController(vehicle, ros_node) if ros_node else None
     tf_broadcaster = None
 
@@ -1182,7 +1379,10 @@ def main():
     print("\n[RUNNING] Ctrl+C ile durdurun.\n")
     print(f"{'Topic':<45} {'Sensor'}")
     print("-" * 65)
-    print(f"{'/ouster/points':<45} Ouster OS0-64 LiDAR")
+    if args.no_ouster:
+        print(f"{'/ouster/points':<45} Ouster OS0-64 LiDAR → C++ BRIDGE")
+    else:
+        print(f"{'/ouster/points':<45} Ouster OS0-64 LiDAR")
     print(f"{'/velodyne/points':<45} Velodyne LiDAR")
     print(f"{'/zed/zed_node/left/image_rect_color':<45} ZED 2 Kamera Sol")
     print(f"{'/zed/left/camera_info':<45} ZED 2 CameraInfo Sol")

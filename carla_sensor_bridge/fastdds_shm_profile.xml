@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS Shared Memory Transport Profile
+  ========================================
+  CARLA sensor bridge için büyük mesajların (PointCloud2 ~6MB, Image ~2.7MB)
+  aynı makinede verimli iletimini sağlar.
+
+  Kullanım:
+    export FASTDDS_DEFAULT_PROFILES_FILE=$(pwd)/fastdds_shm_profile.xml
+    ros2 run ros2_publisher_gcc ros2_publisher_node
+
+  Veya basitçe:
+    source setup_env.sh
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <profiles>
+        <transport_descriptors>
+            <!-- Shared Memory Transport: aynı makinede sıfır-kopya iletim -->
+            <transport_descriptor>
+                <transport_id>shm_transport</transport_id>
+                <type>SHM</type>
+                <!-- Maksimum tek mesaj boyutu: 16 MB (PointCloud2 ~6MB + margin) -->
+                <max_message_size>16777216</max_message_size>
+                <!-- SHM segment boyutu: 128 MB (birden fazla büyük mesaj için) -->
+                <segment_size>134217728</segment_size>
+                <!-- Port kuyruğu kapasitesi: 20 Hz'de yeterli buffer -->
+                <port_queue_capacity>64</port_queue_capacity>
+                <!-- Sağlık kontrolü timeout (ms) -->
+                <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
+            </transport_descriptor>
+
+            <!-- UDP Transport: fallback ve ros2 topic hz gibi araçlar için -->
+            <transport_descriptor>
+                <transport_id>udp_transport</transport_id>
+                <type>UDPv4</type>
+                <sendBufferSize>8388608</sendBufferSize>
+                <receiveBufferSize>8388608</receiveBufferSize>
+                <non_blocking_send>true</non_blocking_send>
+            </transport_descriptor>
+        </transport_descriptors>
+
+        <!-- Default participant: SHM öncelikli, UDP yedek -->
+        <participant profile_name="shm_participant" is_default_profile="true">
+            <rtps>
+                <!-- Builtin transport'ları devre dışı bırak, kendi transport'larımızı kullan -->
+                <useBuiltinTransports>false</useBuiltinTransports>
+                <userTransports>
+                    <transport_id>shm_transport</transport_id>
+                    <transport_id>udp_transport</transport_id>
+                </userTransports>
+            </rtps>
+        </participant>
+    </profiles>
+</dds>

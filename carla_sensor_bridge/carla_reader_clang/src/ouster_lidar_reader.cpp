@@ -1,5 +1,6 @@
 #include "carla_reader_clang/ouster_lidar_reader.hpp"
 #include "carla_reader_clang/tcp_sender.hpp"
+#include "profiling.hpp"
 #include <carla/client/BlueprintLibrary.h>
 #include <iostream>
 
@@ -11,8 +12,8 @@ OusterLidarReader::OusterLidarReader(carla::SharedPtr<carla::client::Actor> pare
     auto lidar_bp = *(bp_lib->Find("sensor.lidar.ray_cast"));
 
     lidar_bp.SetAttribute("channels", "64");
-    lidar_bp.SetAttribute("range", "120.0");
-    lidar_bp.SetAttribute("points_per_second", "1310720");
+    lidar_bp.SetAttribute("range", "50");
+    lidar_bp.SetAttribute("points_per_second", "655360");
     lidar_bp.SetAttribute("rotation_frequency", "20.0");
     lidar_bp.SetAttribute("upper_fov", "22.5");
     lidar_bp.SetAttribute("lower_fov", "-22.5");
@@ -20,6 +21,7 @@ OusterLidarReader::OusterLidarReader(carla::SharedPtr<carla::client::Actor> pare
     lidar_bp.SetAttribute("dropoff_general_rate", "0.0");
     lidar_bp.SetAttribute("dropoff_intensity_limit", "1.0");
     lidar_bp.SetAttribute("dropoff_zero_intensity", "0.0");
+    lidar_bp.SetAttribute("noise_stddev", "0.03");
 
     carla::geom::Transform transform(
         carla::geom::Location(0.85f, 0.0f, 1.10f),
@@ -54,6 +56,8 @@ void OusterLidarReader::destroy() {
 }
 
 void OusterLidarReader::onSensorData(carla::SharedPtr<carla::sensor::SensorData> data) {
+    PROF_READ_BEGIN("OUSTER");
+
     auto lidar_data = std::dynamic_pointer_cast<carla::sensor::data::LidarMeasurement>(data);
     if (!lidar_data) return;
 
@@ -66,8 +70,12 @@ void OusterLidarReader::onSensorData(carla::SharedPtr<carla::sensor::SensorData>
     size_t payload_size = num_points * 4 * sizeof(float);
     const uint8_t* raw_bytes = reinterpret_cast<const uint8_t*>(lidar_data->data());
 
+    PROF_READ_T1();
+
     // Send via TCP Bridge
     TCPSender::getInstance().send(SensorType::OUSTER_LIDAR, timestamp, raw_bytes, payload_size);
+
+    PROF_READ_END("OUSTER");
 }
 
 } // namespace carla_sensor_bridge

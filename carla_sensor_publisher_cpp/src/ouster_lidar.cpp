@@ -47,10 +47,10 @@ OusterLidar::OusterLidar(carla::SharedPtr<carla::client::Actor> parent,
     // Nitelikleri artık kilitsiz olan mutable_bp üzerinden set ediyoruz
     mutable_bp.SetAttribute("channels",          "64");
     mutable_bp.SetAttribute("range",             "50");
-    mutable_bp.SetAttribute("points_per_second", "1310720");
+    mutable_bp.SetAttribute("points_per_second", "655360");
     mutable_bp.SetAttribute("rotation_frequency","20");
-    mutable_bp.SetAttribute("upper_fov",         "45.0");
-    mutable_bp.SetAttribute("lower_fov",         "-45.0");
+    mutable_bp.SetAttribute("upper_fov",         "22.5");
+    mutable_bp.SetAttribute("lower_fov",         "-22.5");
     mutable_bp.SetAttribute("horizontal_fov",    "360");
     mutable_bp.SetAttribute("atmosphere_attenuation_rate", "0.0");
     mutable_bp.SetAttribute("sensor_tick",       "0.05");   // 20 Hz callback

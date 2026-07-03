@@ -10,7 +10,7 @@
 
 #include "carla_reader_clang/tcp_sender.hpp"
 #include "carla_reader_clang/ouster_lidar_reader.hpp"
-// Include others...
+#include "carla_reader_clang/zed_camera_reader.hpp"
 
 using namespace carla_sensor_bridge;
 
@@ -62,9 +62,7 @@ int main(int argc, char** argv) {
 
         // Start Sensor Readers
         OusterLidarReader ouster(vehicle, world);
-        // VelodyneLidarReader velodyne(vehicle);
-        // ZedCameraReader zed(vehicle);
-        // ...
+        ZedCameraReader zed(vehicle, world);
 
         std::cout << "\n[CARLA Reader] Running... Press Ctrl+C to exit.\n\n";
 

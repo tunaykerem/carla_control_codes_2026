@@ -1,4 +1,5 @@
 #include "ros2_publisher_gcc/ouster_lidar_publisher.hpp"
+#include "profiling.hpp"
 #include <cmath>
 #include <cstring>
 #include <chrono>
@@ -70,6 +71,8 @@ void OusterLidarPublisher::onTcpDataReceived(const PacketHeader& header, const s
 }
 
 void OusterLidarPublisher::processAndPublish(const float* raw_pts, size_t n_total, double timestamp) {
+    PROF_PUB_BEGIN("OUSTER");
+
     // 1. Parse + Y-flip + organize
     std::vector<float> pts(n_total * 4);
     for (size_t i = 0; i < n_total; i++) {
@@ -183,7 +186,11 @@ void OusterLidarPublisher::processAndPublish(const float* raw_pts, size_t n_tota
     msg.fields = fields_;
     msg.data = std::move(buf);
 
+    PROF_PUB_T4();
+
     pub_->publish(msg);
+
+    PROF_PUB_END("OUSTER");
 }
 
 } // namespace carla_sensor_bridge

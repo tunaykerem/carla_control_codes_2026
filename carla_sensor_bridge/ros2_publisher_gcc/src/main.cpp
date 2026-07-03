@@ -5,7 +5,7 @@
 
 #include "ros2_publisher_gcc/tcp_receiver.hpp"
 #include "ros2_publisher_gcc/ouster_lidar_publisher.hpp"
-// Include others...
+#include "ros2_publisher_gcc/zed_camera_publisher.hpp"
 
 using namespace carla_sensor_bridge;
 
@@ -30,9 +30,7 @@ int main(int argc, char** argv) {
 
     // Initialize Publishers
     OusterLidarPublisher ouster(node);
-    // VelodyneLidarPublisher velodyne(node);
-    // ZedCameraPublisher zed(node);
-    // ...
+    ZedCameraPublisher zed(node);
 
     std::cout << "\n[ROS 2 Publisher] Ready and listening for CARLA bridge connections.\n\n";
 

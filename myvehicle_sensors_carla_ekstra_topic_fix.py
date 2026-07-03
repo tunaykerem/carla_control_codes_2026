@@ -216,10 +216,10 @@ class OusterLidar:
         bp = world.get_blueprint_library().find('sensor.lidar.ray_cast')
         bp.set_attribute('channels',          '64')
         bp.set_attribute('range',             '50')
-        bp.set_attribute('points_per_second', '1310720')
+        bp.set_attribute('points_per_second', '655360')
         bp.set_attribute('rotation_frequency','20')
-        bp.set_attribute('upper_fov',         '45.0')
-        bp.set_attribute('lower_fov',         '-45.0')
+        bp.set_attribute('upper_fov',         '22.5')
+        bp.set_attribute('lower_fov',         '-22.5')
         bp.set_attribute('horizontal_fov',    '360')
         bp.set_attribute('atmosphere_attenuation_rate', '0.0')
         bp.set_attribute('sensor_tick',       '0.05')   # 20 Hz callback
@@ -1169,7 +1169,7 @@ class VehicleController:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SensorManager:
-    def __init__(self, world, vehicle, ros_node=None, no_ouster=False):
+    def __init__(self, world, vehicle, ros_node=None, no_ouster=False, no_zed=False):
         self.vehicle = vehicle
         self._sensors = []
         node = ros_node
@@ -1188,9 +1188,13 @@ class SensorManager:
         self._sensors.append(self.velodyne)
         print("  ✓ Velodyne LiDAR")
 
-        self.zed      = ZedCamera(vehicle, node)
-        self._sensors.append(self.zed)
-        print("  ✓ ZED 2 Stereo Kamera (sol + sağ)")
+        if no_zed:
+            self.zed = None
+            print("  ⏭ ZED 2 Stereo Kamera → ATLANADI (--no-zed, C++ bridge kullanılacak)")
+        else:
+            self.zed      = ZedCamera(vehicle, node)
+            self._sensors.append(self.zed)
+            print("  ✓ ZED 2 Stereo Kamera (sol + sağ)")
 
         self.imu      = IMUSensorPublisher(vehicle, node)
         self._sensors.append(self.imu)
@@ -1293,6 +1297,8 @@ def main():
                     help='Yeni araç spawn etme; sadece mevcut araca sensör ekle')
     ap.add_argument('--no-ouster', action='store_true',
                     help='Ouster LiDAR sensörünü spawn etme (C++ bridge kullanıldığında)')
+    ap.add_argument('--no-zed', action='store_true',
+                    help='ZED kamera sensörünü spawn etme (C++ bridge kullanıldığında)')
     args = ap.parse_args()
 
     # ── ROS 2 kurulumu ─────────────────────────────────────────────────────
@@ -1340,7 +1346,7 @@ def main():
     # ── Araç ve sensörler ──────────────────────────────────────────────────
     vehicle    = find_or_spawn_vehicle(world, args.filter,
                                        attach_only=getattr(args, 'attach_only', False))
-    sensor_mgr = SensorManager(world, vehicle, ros_node, no_ouster=args.no_ouster)
+    sensor_mgr = SensorManager(world, vehicle, ros_node, no_ouster=args.no_ouster, no_zed=args.no_zed)
     vehicle_ctrl = VehicleController(vehicle, ros_node) if ros_node else None
     tf_broadcaster = None
 

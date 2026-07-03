@@ -166,14 +166,16 @@ colcon build --packages-select ros2_publisher_gcc
 ### T1 — CARLA Simülasyon
 
 ```bash
-cd ~/itu_sct_gae/carla/carla_build_mapler/carla_dubalar_eklendi/Carla-0.10.0-Linux-Shipping/Linux
+# CARLA_SIM_DIR ortam değişkeni ile:
+export CARLA_SIM_DIR=/path/to/Carla-0.10.0-Linux-Shipping/Linux
+cd $CARLA_SIM_DIR
 ./CarlaUnreal.sh
 ```
 
 ### T2 — Araç Kontrolü
 
 ```bash
-cd ~/itu_sct_gae/carla/carla_control_codes_2026
+cd <proje_dizini>  # klonladığınız repo dizini
 python3 myvehicle_control.py
 ```
 
@@ -183,7 +185,7 @@ python3 myvehicle_control.py
 
 ```bash
 source /opt/ros/humble/setup.bash
-cd ~/itu_sct_gae/carla/carla_control_codes_2026
+cd <proje_dizini>
 python3 myvehicle_sensors_carla_ekstra_topic_fix.py --ros --attach-only --no-ouster
 ```
 
@@ -191,14 +193,14 @@ python3 myvehicle_sensors_carla_ekstra_topic_fix.py --ros --attach-only --no-ous
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/itu_sct_gae/carla/carla_control_codes_2026/carla_sensor_bridge/install/setup.bash
+source <proje_dizini>/carla_sensor_bridge/install/setup.bash
 ros2 run ros2_publisher_gcc ros2_publisher_node
 ```
 
 ### T5 — CARLA Reader (C++)
 
 ```bash
-cd ~/itu_sct_gae/carla/carla_control_codes_2026/carla_sensor_bridge/carla_reader_clang/build
+cd <proje_dizini>/carla_sensor_bridge/carla_reader_clang/build
 ./carla_reader_node
 ```
 

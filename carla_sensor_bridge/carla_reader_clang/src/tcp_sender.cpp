@@ -1,4 +1,5 @@
 #include "carla_reader_clang/tcp_sender.hpp"
+#include "profiling.hpp"
 #include <iostream>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -53,6 +54,7 @@ void TCPSender::send(SensorType type, double timestamp, const uint8_t* data, uin
             queue_.pop(); // Drop oldest if queue is full
         }
         queue_.push(std::move(pkt));
+        PROF_TCP_QUEUE(queue_.size(), size);
     }
     cv_.notify_one();
 }

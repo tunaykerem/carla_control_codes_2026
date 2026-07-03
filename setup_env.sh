@@ -31,7 +31,6 @@ else
     SEARCH_PATHS=(
         "$HOME/CarlaUE5"
         "$HOME/carla/CarlaUE5"
-        "$HOME/itu_sct_gae/karla_zimulazyon/CarlaUE5"
         "/opt/carla/CarlaUE5"
         "/opt/CarlaUE5"
     )

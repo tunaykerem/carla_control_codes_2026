@@ -23,6 +23,7 @@ public:
     void shutdown();
 
     // Kuyruğa asenkron veri ekle (CARLA callback'lerini bloklamamak için)
+    // LiDAR verileri yüksek öncelikli kuyruğa, kamera verileri düşük öncelikli kuyruğa eklenir.
     void send(SensorType type, double timestamp, const uint8_t* data, uint32_t size);
 
 private:
@@ -43,7 +44,10 @@ private:
         std::vector<uint8_t> payload;
     };
 
-    std::queue<Packet> queue_;
+    // Dual priority queues: LiDAR (high) vs Camera (low)
+    std::queue<Packet> hi_queue_;  // Ouster LiDAR
+    std::queue<Packet> lo_queue_;  // ZED Camera & others
+    int lidar_sent_since_cam_ = 0; // Fair scheduling counter
     std::mutex mutex_;
     std::condition_variable cv_;
     std::thread sender_thread_;

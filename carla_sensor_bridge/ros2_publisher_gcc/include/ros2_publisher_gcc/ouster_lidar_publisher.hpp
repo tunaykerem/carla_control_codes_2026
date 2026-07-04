@@ -2,7 +2,6 @@
 
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -18,8 +17,7 @@ public:
     static constexpr const char* TOPIC    = "/ouster/points";
     static constexpr const char* FRAME_ID = "ouster";
     static constexpr int NUM_CHANNELS     = 64;
-    static constexpr int NUM_SECTORS      = 12;
-    static constexpr int POINT_STEP       = 48; // x,y,z,intensity,t,ring
+    static constexpr int POINT_STEP       = 48; // x,y,z,pad,intensity,t,reflectivity,ring,ambient,pad,range,pad
 
     OusterLidarPublisher(rclcpp::Node::SharedPtr node);
     ~OusterLidarPublisher();
@@ -34,8 +32,10 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
 
     std::mutex busy_;
-    std::unordered_map<int, std::vector<float>> sector_grid_;
-    std::unordered_map<int, double>             sector_stamp_;
+
+    // Reusable byte buffer to avoid per-frame allocation
+    std::vector<uint8_t> reusable_buf_;
+
     std::vector<sensor_msgs::msg::PointField> fields_;
 };
 

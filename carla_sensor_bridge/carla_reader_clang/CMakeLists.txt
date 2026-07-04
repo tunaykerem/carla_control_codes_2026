@@ -105,6 +105,7 @@ target_link_libraries(carla_reader_node
   ${CARLA_RECAST_LIB_DETOUR}
   ${CARLA_RECAST_LIB_DETOURCROWD}
   ${CARLA_RECAST_LIB_RECAST}
+  jpeg
   pthread
 )
 

@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <chrono>
+#include <netinet/tcp.h>
 
 namespace carla_sensor_bridge {
 
@@ -50,11 +51,22 @@ void TCPSender::send(SensorType type, double timestamp, const uint8_t* data, uin
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (queue_.size() > 100) {
-            queue_.pop(); // Drop oldest if queue is full
+
+        // Separate handling: LiDAR gets priority, camera is drop-if-full
+        if (type == SensorType::OUSTER_LIDAR) {
+            // LiDAR: keep up to 10 in high-priority queue, drop oldest if exceeded
+            if (hi_queue_.size() > 10) {
+                hi_queue_.pop();
+            }
+            hi_queue_.push(std::move(pkt));
+        } else {
+            // Camera/other: keep only the latest 2 frames
+            while (lo_queue_.size() >= 2) {
+                lo_queue_.pop();
+            }
+            lo_queue_.push(std::move(pkt));
         }
-        queue_.push(std::move(pkt));
-        PROF_TCP_QUEUE(queue_.size(), size);
+        PROF_TCP_QUEUE(hi_queue_.size() + lo_queue_.size(), size);
     }
     cv_.notify_one();
 }
@@ -85,6 +97,10 @@ bool TCPSender::connectToServer() {
     int send_buf_size = 8 * 1024 * 1024;
     setsockopt(socket_fd_, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
 
+    // Disable Nagle's algorithm for lower latency
+    int flag = 1;
+    setsockopt(socket_fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
     return true;
 }
 
@@ -105,14 +121,28 @@ void TCPSender::senderThreadFunc() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { 
-                return !queue_.empty() || !running_; 
+                return !hi_queue_.empty() || !lo_queue_.empty() || !running_; 
             });
 
             if (!running_) break;
-            if (queue_.empty()) continue;
 
-            pkt = std::move(queue_.front());
-            queue_.pop();
+            // Fair scheduling: after 2 consecutive LiDAR sends, force 1 camera send
+            bool cam_starved = !lo_queue_.empty() && lidar_sent_since_cam_ >= 2;
+            if (cam_starved) {
+                pkt = std::move(lo_queue_.front());
+                lo_queue_.pop();
+                lidar_sent_since_cam_ = 0;
+            } else if (!hi_queue_.empty()) {
+                pkt = std::move(hi_queue_.front());
+                hi_queue_.pop();
+                lidar_sent_since_cam_++;
+            } else if (!lo_queue_.empty()) {
+                pkt = std::move(lo_queue_.front());
+                lo_queue_.pop();
+                lidar_sent_since_cam_ = 0;
+            } else {
+                continue;
+            }
         }
 
         // Send header

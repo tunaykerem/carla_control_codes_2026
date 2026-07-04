@@ -208,9 +208,10 @@ class OusterLidar:
         self._pub = None
         self._busy = threading.Lock()   # async publish: meşgulse callback'i atla
 
-        # ── Sektör birikme durumu ──────────────────────────────────────
-        self._sector_grid  = {}   # {0..11 : np.ndarray (N, 4)}
-        self._sector_stamp = {}   # {0..11 : float}  — CARLA timestamp
+        # ── Sektör birikme durumu (incremental cache) ─────────────────
+        self._sector_bytes  = {}   # {0..11 : bytearray}  — pre-built 48B struct
+        self._sector_stamp  = {}   # {0..11 : float}  — CARLA timestamp
+        self._sector_nperch = {}   # {0..11 : int}    — azimuth sayısı
 
         world = parent_actor.get_world()
         bp = world.get_blueprint_library().find('sensor.lidar.ray_cast')
@@ -289,9 +290,9 @@ class OusterLidar:
     _prof_last_time  = 0.0
     _prof_interval   = []   # callback arası süre (ms)
     _prof_parse      = []   # parse + Y-flip + organize (ms)
-    _prof_sector     = []   # azimuth hesap + sektör yazma (ms)
-    _prof_concat     = []   # taze sektör toplama + concat (ms)
-    _prof_struct     = []   # 48-byte struct build (ms)
+    _prof_sector     = []   # azimuth + per-sector 48B struct build (ms)
+    _prof_concat     = []   # byte buffer concat + t recalc (ms)
+    _prof_struct     = []   # (legacy — artık sektör adımında) (ms)
     _prof_tobytes    = []   # cloud.tobytes() süresi (ms)
     _prof_pub_only   = []   # sadece publish() süresi (ms)
     _prof_total      = []   # toplam callback süresi (ms)
@@ -319,7 +320,7 @@ class OusterLidar:
             N_SEC   = OusterLidar.NUM_SECTORS
             STALE_S = OusterLidar.STALE_S
 
-            # ── 1. Parse ──────────────────────────────────────────────────
+            # ── 1. Parse + Y-flip + organize ─────────────────────────────
             t0 = time.time()
             pts_raw = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4).copy()
             n_total = len(pts_raw)
@@ -337,84 +338,92 @@ class OusterLidar:
             ).reshape(used, 4)
             t1 = time.time()
 
-            # ── 2. Self-hit filter: XYZ only, preserve intensity ──────────
-            # (devre dışı)
-
-            # ── 3. Ortalama azimuth → sektör indeksi ──────────────────────
+            # ── 2. Sampled azimuth → sektör indeksi ──────────────────────
+            #    Eski: tüm ~32K nokta üzerinde arctan2
+            #    Yeni: her 512. noktayı örnekle (~64 nokta) — aynı doğruluk
             t2 = time.time()
-            mean_az = float(np.nanmean(np.arctan2(organized[:, 1], organized[:, 0])))
+            sample_step = max(1, used // 64)
+            sampled = organized[::sample_step]
+            mean_az = float(np.nanmean(np.arctan2(sampled[:, 1], sampled[:, 0])))
             if np.isnan(mean_az):
                 return
 
             now     = data.timestamp
             sec_idx = int((mean_az + np.pi) / (2.0 * np.pi) * N_SEC) % N_SEC
 
-            # ── 4. Sektör slot'unu yaz ────────────────────────────────────
-            self._sector_grid[sec_idx]  = organized
-            self._sector_stamp[sec_idx] = now
-            t3 = time.time()
+            # ── 3. Bu sektör için 48-byte struct'ı ÖNCEden oluştur ────────
+            #    Eski: tüm ~300K nokta her callback'te yeniden yapılandırılıyordu
+            #    Yeni: sadece ~32K yeni nokta yapılandırılır, cache'lenir
+            ring = np.tile(np.arange(NUM_CH, dtype=np.uint16), n_per_ch)
 
-            # ── 5. Güncel sektörleri topla ────────────────────────────────
-            oldest_allowed = now - STALE_S
-            fresh_sectors = [
-                (idx, pts) for idx, pts in self._sector_grid.items()
-                if self._sector_stamp.get(idx, -999.0) >= oldest_allowed
-            ]
-
-            if not fresh_sectors:
-                return
-
-            pts_list  = []
-            ring_list = []
-            for _idx, pts in fresh_sectors:
-                n_az_i = len(pts) // NUM_CH
-                used_i = n_az_i * NUM_CH
-                pts_list.append(pts[:used_i])
-                ring_list.append(
-                    np.tile(np.arange(NUM_CH, dtype=np.uint16), n_az_i)
-                )
-
-            full_pts  = np.concatenate(pts_list,  axis=0)
-            full_ring = np.concatenate(ring_list, axis=0)
-
-            n_total_pts   = len(full_pts)
-            n_per_ch_full = n_total_pts // NUM_CH
-            if n_per_ch_full == 0:
-                return
-            used_full = n_per_ch_full * NUM_CH
-            full_pts  = full_pts[:used_full]
-            full_ring = full_ring[:used_full]
-            t4 = time.time()
-
-            # ── 6. Yapılandırılmış 48-byte cloud (zero-copy) ──────────────
-            # bytearray pre-alloc → numpy view → doğrudan msg.data ataması
-            # tobytes() çağrısı YOK → GIL çekişmesi ve 140ms kopyalama ortadan kalkar
-            buf   = bytearray(used_full * 48)
-            cloud = np.ndarray(shape=(used_full,),
+            sector_buf = bytearray(used * 48)
+            cloud = np.ndarray(shape=(used,),
                                dtype=OusterLidar._OUSTER_DTYPE,
-                               buffer=buf)
+                               buffer=sector_buf)
 
-            cloud['x']         = full_pts[:, 0]
-            cloud['y']         = full_pts[:, 1]
-            cloud['z']         = full_pts[:, 2]
-            cloud['intensity'] = full_pts[:, 3]
-            cloud['ring']      = full_ring
+            cloud['x']         = organized[:, 0]
+            cloud['y']         = organized[:, 1]
+            cloud['z']         = organized[:, 2]
+            cloud['intensity'] = organized[:, 3]
+            cloud['ring']      = ring
 
-            refl = np.nan_to_num(full_pts[:, 3], nan=0.0)
+            refl = np.nan_to_num(organized[:, 3], nan=0.0)
             cloud['reflectivity'] = np.clip(refl * 257.0, 0, 65535).astype(np.uint16)
 
             cloud['range'] = (
-                np.sqrt(np.nansum(full_pts[:, :3] ** 2, axis=1)) * 1000
+                np.sqrt(np.nansum(organized[:, :3] ** 2, axis=1)) * 1000
             ).astype(np.uint32)
+            # 't' alanı aşağıda global olarak hesaplanacak
 
+            # Cache pre-built bytes
+            self._sector_bytes[sec_idx]  = sector_buf
+            self._sector_stamp[sec_idx]  = now
+            self._sector_nperch[sec_idx] = n_per_ch
+            t3 = time.time()
+
+            # ── 4. Cached byte buffer'ları birleştir ──────────────────────
+            #    Eski: tüm sektörlerin float verileri concat + 48B struct rebuild
+            #    Yeni: sadece bytearray.join — saf memcpy, struct rebuild YOK
+            oldest_allowed = now - STALE_S
+            fresh_bufs = []
+            total_n_per_ch = 0
+            n_fresh = 0
+            stale_keys = []
+            for idx in list(self._sector_stamp.keys()):
+                if self._sector_stamp[idx] >= oldest_allowed and idx in self._sector_bytes:
+                    fresh_bufs.append(self._sector_bytes[idx])
+                    total_n_per_ch += self._sector_nperch[idx]
+                    n_fresh += 1
+                elif self._sector_stamp[idx] < oldest_allowed:
+                    stale_keys.append(idx)
+
+            # Eski sektörleri temizle
+            for idx in stale_keys:
+                self._sector_bytes.pop(idx, None)
+                self._sector_stamp.pop(idx, None)
+                self._sector_nperch.pop(idx, None)
+
+            if not fresh_bufs or total_n_per_ch == 0:
+                return
+
+            total_points = total_n_per_ch * NUM_CH
+
+            # Hızlı byte birleştirme (struct rebuild YOK — saf memcpy)
+            final_buf = bytearray().join(fresh_bufs)
+
+            # 't' alanını global olarak yeniden hesapla (motion compensation için)
+            t_view = np.ndarray(shape=(total_points,),
+                                dtype=OusterLidar._OUSTER_DTYPE,
+                                buffer=final_buf)
             PERIOD_NS = np.uint32(50_000_000)
-            cloud['t'] = (
-                np.arange(n_per_ch_full, dtype=np.uint32).repeat(NUM_CH)
-                * (PERIOD_NS // np.uint32(n_per_ch_full))
+            t_view['t'] = (
+                np.arange(total_n_per_ch, dtype=np.uint32).repeat(NUM_CH)
+                * (PERIOD_NS // np.uint32(max(1, total_n_per_ch)))
             )
-            t5 = time.time()
+            t4 = time.time()
 
-            # ── 7a. msg oluştur (tobytes YOK — doğrudan bytearray) ────────
+            # ── 5a. msg oluştur ───────────────────────────────────────────
+            n_per_ch_full = total_n_per_ch
             msg             = PointCloud2()
             msg.header      = make_header(OusterLidar.FRAME_ID, _carla_stamp(data))
             msg.height      = n_per_ch_full
@@ -424,23 +433,23 @@ class OusterLidar:
             msg.point_step  = 48
             msg.row_step    = 48 * NUM_CH
             msg.fields      = OusterLidar._FIELDS
-            msg.data        = buf          # ← zero-copy: bytearray doğrudan atanır
-            t6 = time.time()
+            msg.data        = final_buf
+            t5 = time.time()
 
-            # ── 7b. publish ───────────────────────────────────────────────
+            # ── 5b. publish ───────────────────────────────────────────────
             self._pub.publish(msg)
-            t7 = time.time()
+            t6 = time.time()
 
             # ── PROFILING ─────────────────────────────────────────────────
             OusterLidar._prof_parse.append((t1 - t0) * 1000.0)
             OusterLidar._prof_sector.append((t3 - t2) * 1000.0)
             OusterLidar._prof_concat.append((t4 - t3) * 1000.0)
-            OusterLidar._prof_struct.append((t5 - t4) * 1000.0)
-            OusterLidar._prof_tobytes.append((t6 - t5) * 1000.0)
-            OusterLidar._prof_pub_only.append((t7 - t6) * 1000.0)
-            OusterLidar._prof_total.append((t7 - t_start) * 1000.0)
-            OusterLidar._prof_n_points.append(used_full)
-            OusterLidar._prof_n_sectors.append(len(fresh_sectors))
+            OusterLidar._prof_struct.append(0.0)  # artık sektör adımında
+            OusterLidar._prof_tobytes.append((t5 - t4) * 1000.0)
+            OusterLidar._prof_pub_only.append((t6 - t5) * 1000.0)
+            OusterLidar._prof_total.append((t6 - t_start) * 1000.0)
+            OusterLidar._prof_n_points.append(total_points)
+            OusterLidar._prof_n_sectors.append(n_fresh)
             OusterLidar._prof_count += 1
 
             if OusterLidar._prof_count % OusterLidar._PROF_EVERY == 0:
@@ -459,11 +468,10 @@ class OusterLidar:
                 print(f"  Callback frekansı   : {avg_hz:6.1f} Hz  (aralık: ort={_avg(interval):6.1f} ms, max={_max(interval):6.1f} ms)")
                 print(f"  ──────────────────────────────────────────────────────")
                 print(f"  1. Parse+Organize   : ort={_avg(OusterLidar._prof_parse):6.2f} ms, max={_max(OusterLidar._prof_parse):6.2f} ms")
-                print(f"  2. Sektör hesaplama : ort={_avg(OusterLidar._prof_sector):6.2f} ms, max={_max(OusterLidar._prof_sector):6.2f} ms")
-                print(f"  3. Concat+Ring      : ort={_avg(OusterLidar._prof_concat):6.2f} ms, max={_max(OusterLidar._prof_concat):6.2f} ms")
-                print(f"  4. 48B Struct build : ort={_avg(OusterLidar._prof_struct):6.2f} ms, max={_max(OusterLidar._prof_struct):6.2f} ms")
-                print(f"  5a. msg build       : ort={_avg(OusterLidar._prof_tobytes):6.2f} ms, max={_max(OusterLidar._prof_tobytes):6.2f} ms")
-                print(f"  5b. publish()       : ort={_avg(OusterLidar._prof_pub_only):6.2f} ms, max={_max(OusterLidar._prof_pub_only):6.2f} ms")
+                print(f"  2. Azimuth+48B sect : ort={_avg(OusterLidar._prof_sector):6.2f} ms, max={_max(OusterLidar._prof_sector):6.2f} ms")
+                print(f"  3. Concat+t recalc  : ort={_avg(OusterLidar._prof_concat):6.2f} ms, max={_max(OusterLidar._prof_concat):6.2f} ms")
+                print(f"  4a. msg build       : ort={_avg(OusterLidar._prof_tobytes):6.2f} ms, max={_max(OusterLidar._prof_tobytes):6.2f} ms")
+                print(f"  4b. publish()       : ort={_avg(OusterLidar._prof_pub_only):6.2f} ms, max={_max(OusterLidar._prof_pub_only):6.2f} ms")
                 print(f"  ──────────────────────────────────────────────────────")
                 print(f"  TOPLAM              : ort={_avg(OusterLidar._prof_total):6.2f} ms, max={_max(OusterLidar._prof_total):6.2f} ms")
                 print(f"  Mesaj boyutu        : {msg_kb:.0f} KB  ({_avg(OusterLidar._prof_n_points):,.0f} nokta × 48B)")

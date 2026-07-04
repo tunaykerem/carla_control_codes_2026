@@ -27,6 +27,9 @@ OusterLidarPublisher::OusterLidarPublisher(rclcpp::Node::SharedPtr node) : node_
     pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(TOPIC, qos);
     fields_ = buildFields();
 
+    // Pre-allocate reusable buffer (will be resized if needed)
+    reusable_buf_.reserve(NUM_CHANNELS * 512 * POINT_STEP);
+
     // Register callback with the TCP Receiver
     TCPReceiver::getInstance().registerCallback(SensorType::OUSTER_LIDAR, 
         [this](const PacketHeader& header, const std::vector<uint8_t>& payload) {
@@ -70,123 +73,77 @@ void OusterLidarPublisher::onTcpDataReceived(const PacketHeader& header, const s
     processAndPublish(raw_pts, n_total, header.timestamp);
 }
 
-void OusterLidarPublisher::processAndPublish(const float* raw_pts, size_t n_total, double timestamp) {
+void OusterLidarPublisher::processAndPublish(const float* raw_pts, size_t n_total, double /*timestamp*/) {
     PROF_PUB_BEGIN("OUSTER");
 
-    // 1. Parse + Y-flip + organize
-    std::vector<float> pts(n_total * 4);
-    for (size_t i = 0; i < n_total; i++) {
-        pts[i*4 + 0] =  raw_pts[i*4 + 0];
-        pts[i*4 + 1] = -raw_pts[i*4 + 1]; // CARLA->ROS flip
-        pts[i*4 + 2] =  raw_pts[i*4 + 2];
-        pts[i*4 + 3] =  raw_pts[i*4 + 3];
-    }
+    // Direct publish: each callback's partial scan is published immediately.
+    // No sector accumulation — downstream systems handle partial scans natively.
 
     size_t n_per_ch = n_total / NUM_CHANNELS;
     size_t used = n_per_ch * NUM_CHANNELS;
+    if (used == 0) return;
 
-    std::vector<float> organized(used * 4);
+    // Resize reusable buffer (avoids alloc if capacity is already sufficient)
+    size_t buf_size = used * POINT_STEP;
+    reusable_buf_.resize(buf_size);
+    std::memset(reusable_buf_.data(), 0, buf_size);
+
+    // Time-step for the 't' field (motion compensation)
+    uint32_t period_ns = 50000000u; // 50ms = 1/20Hz
+    uint32_t t_step = (n_per_ch > 0) ? (period_ns / static_cast<uint32_t>(n_per_ch)) : 0;
+
+    // Single-pass: reorganize channel-first -> azimuth-first, Y-flip, build 48-byte struct
     for (size_t az = 0; az < n_per_ch; az++) {
+        uint32_t t_val = static_cast<uint32_t>(az * t_step);
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {
             size_t src_idx = ch * n_per_ch + az;
             size_t dst_idx = az * NUM_CHANNELS + ch;
-            if (src_idx < n_total) {
-                organized[dst_idx*4 + 0] = pts[src_idx*4 + 0];
-                organized[dst_idx*4 + 1] = pts[src_idx*4 + 1];
-                organized[dst_idx*4 + 2] = pts[src_idx*4 + 2];
-                organized[dst_idx*4 + 3] = pts[src_idx*4 + 3];
-            }
-        }
-    }
 
-    // 2. Mean azimuth -> sector index
-    double sum_az = 0.0;
-    size_t count_az = 0;
-    for (size_t i = 0; i < used; i++) {
-        float x = organized[i*4 + 0];
-        float y = organized[i*4 + 1];
-        if (x != 0.0f || y != 0.0f) {
-            sum_az += std::atan2(y, x);
-            count_az++;
-        }
-    }
-    if (count_az == 0) return;
-    
-    double mean_az = sum_az / count_az;
-    int sec_idx = static_cast<int>((mean_az + M_PI) / (2.0 * M_PI) * NUM_SECTORS) % NUM_SECTORS;
-    if (sec_idx < 0) sec_idx += NUM_SECTORS;
+            if (src_idx >= n_total) continue;
 
-    // 3. Write sector slot
-    sector_grid_[sec_idx] = organized;
-    sector_stamp_[sec_idx] = timestamp;
+            float x = raw_pts[src_idx * 4 + 0];
+            float y = -raw_pts[src_idx * 4 + 1]; // CARLA->ROS Y-flip
+            float z = raw_pts[src_idx * 4 + 2];
+            float intensity = raw_pts[src_idx * 4 + 3];
 
-    // 4. Collect fresh sectors
-    double STALE_S = 0.20;
-    double oldest_allowed = timestamp - STALE_S;
-    std::vector<const std::vector<float>*> fresh_sectors;
-    for (auto& [idx, pts_vec] : sector_grid_) {
-        if (sector_stamp_.count(idx) && sector_stamp_[idx] >= oldest_allowed) {
-            fresh_sectors.push_back(&pts_vec);
-        }
-    }
-    if (fresh_sectors.empty()) return;
+            uint8_t* p = reusable_buf_.data() + dst_idx * POINT_STEP;
 
-    size_t total_fresh = 0;
-    for (auto* s : fresh_sectors) total_fresh += s->size() / 4;
-
-    size_t n_per_ch_full = total_fresh / NUM_CHANNELS;
-    if (n_per_ch_full == 0) return;
-    size_t used_full = n_per_ch_full * NUM_CHANNELS;
-
-    // 5. Build 48-byte structured cloud
-    std::vector<uint8_t> buf(used_full * POINT_STEP, 0);
-    size_t pt_idx = 0;
-    for (auto* sector_pts : fresh_sectors) {
-        size_t n_pts = sector_pts->size() / 4;
-        for (size_t i = 0; i < n_pts && pt_idx < used_full; i++, pt_idx++) {
-            float x = (*sector_pts)[i*4 + 0];
-            float y = (*sector_pts)[i*4 + 1];
-            float z = (*sector_pts)[i*4 + 2];
-            float intensity = (*sector_pts)[i*4 + 3];
-
-            uint8_t* p = buf.data() + pt_idx * POINT_STEP;
+            // x, y, z (offset 0, 4, 8)
             std::memcpy(p + 0, &x, 4);
             std::memcpy(p + 4, &y, 4);
             std::memcpy(p + 8, &z, 4);
+            // intensity (offset 16)
             std::memcpy(p + 16, &intensity, 4);
-
-            uint16_t ring = static_cast<uint16_t>(pt_idx % NUM_CHANNELS);
-            std::memcpy(p + 26, &ring, 2);
-
+            // t (offset 20)
+            std::memcpy(p + 20, &t_val, 4);
+            // reflectivity (offset 24) — derived from intensity
             float refl_f = std::isnan(intensity) ? 0.0f : intensity;
             uint16_t refl = static_cast<uint16_t>(std::min(65535.0f, std::max(0.0f, refl_f * 257.0f)));
             std::memcpy(p + 24, &refl, 2);
-
-            float range_m = std::sqrt(x*x + y*y + z*z);
+            // ring (offset 26)
+            uint16_t ring = static_cast<uint16_t>(ch);
+            std::memcpy(p + 26, &ring, 2);
+            // range (offset 32)
+            float range_m = std::sqrt(x * x + y * y + z * z);
             uint32_t range_mm = static_cast<uint32_t>(range_m * 1000.0f);
             std::memcpy(p + 32, &range_mm, 4);
-
-            uint32_t period_ns = 50000000u;
-            uint32_t t_val = static_cast<uint32_t>((pt_idx / NUM_CHANNELS) *
-                             (period_ns / static_cast<uint32_t>(n_per_ch_full)));
-            std::memcpy(p + 20, &t_val, 4);
         }
     }
 
-    // 6. Build and publish PointCloud2 message
+    PROF_PUB_T4();
+
+    // Build and publish PointCloud2 message
     auto msg = sensor_msgs::msg::PointCloud2();
     msg.header.frame_id = FRAME_ID;
     msg.header.stamp = wallClockStamp();
-    msg.height = static_cast<uint32_t>(n_per_ch_full);
-    msg.width  = static_cast<uint32_t>(NUM_CHANNELS);
+    msg.height = static_cast<uint32_t>(NUM_CHANNELS);
+    msg.width  = static_cast<uint32_t>(n_per_ch);
     msg.is_dense = false;
     msg.is_bigendian = false;
     msg.point_step = POINT_STEP;
-    msg.row_step = POINT_STEP * NUM_CHANNELS;
+    msg.row_step = POINT_STEP * n_per_ch;
     msg.fields = fields_;
-    msg.data = std::move(buf);
-
-    PROF_PUB_T4();
+    msg.data.assign(reusable_buf_.begin(), reusable_buf_.begin() + static_cast<long>(buf_size));
 
     pub_->publish(msg);
 

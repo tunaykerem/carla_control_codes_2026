@@ -1,8 +1,9 @@
 // Copyright (c) 2025. MIT License.
-// zed_camera_publisher.cpp — ZED mono camera: TCP → BGR8 Image + CameraInfo
+// zed_camera_publisher.cpp — ZED mono camera: TCP JPEG → BGR8 Image + CameraInfo
 //
-// Receives BGRA frames from carla_reader_clang via TCP bridge.
-// Applies brightness ×3.5, converts BGRA → BGR8, publishes as ROS 2 Image.
+// Receives JPEG-compressed BGR frames from carla_reader_clang via TCP bridge.
+// Brightness scaling is done on the reader side before compression.
+// This publisher just decodes JPEG and publishes as ROS 2 Image.
 
 #include "ros2_publisher_gcc/zed_camera_publisher.hpp"
 #include "profiling.hpp"
@@ -14,7 +15,7 @@
 #include <algorithm>
 
 #include <opencv2/core.hpp>
-#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <cv_bridge/cv_bridge.h>
 
 namespace carla_sensor_bridge {
@@ -51,7 +52,8 @@ ZedCameraPublisher::ZedCameraPublisher(rclcpp::Node::SharedPtr node)
         });
 
     std::cout << "[ROS 2 Publisher] Registered ZED Camera Publisher on topics "
-              << IMAGE_TOPIC << ", " << INFO_TOPIC << std::endl;
+              << IMAGE_TOPIC << ", " << INFO_TOPIC
+              << " [JPEG decode mode]" << std::endl;
 }
 
 ZedCameraPublisher::~ZedCameraPublisher() {}
@@ -98,36 +100,30 @@ void ZedCameraPublisher::onTcpDataReceived(const PacketHeader& /*header*/,
                                             const std::vector<uint8_t>& payload) {
     if (!pub_img_) return;
 
-    // Non-blocking: if previous frame is still being processed, drop this one
-    std::unique_lock<std::mutex> lk(busy_, std::try_to_lock);
-    if (!lk.owns_lock()) return;
-
     PROF_PUB_BEGIN("ZED");
 
-    // Payload format: [width(4B) | height(4B) | BGRA pixel data]
+    // Payload format: [width(4B) | height(4B) | JPEG compressed BGR data]
     if (payload.size() < 8) return;
 
     uint32_t width, height;
     std::memcpy(&width,  payload.data(),     sizeof(uint32_t));
     std::memcpy(&height, payload.data() + 4, sizeof(uint32_t));
 
-    size_t expected_pixel_bytes = static_cast<size_t>(width) * height * 4;
-    if (payload.size() < 8 + expected_pixel_bytes) return;
+    size_t jpeg_size = payload.size() - 8;
+    if (jpeg_size == 0) return;
 
-    // ── 1. Wrap BGRA data as OpenCV Mat (no copy) ────────────────────────
-    const uint8_t* pixel_data = payload.data() + 8;
-    cv::Mat bgra(static_cast<int>(height), static_cast<int>(width), CV_8UC4,
-                 const_cast<uint8_t*>(pixel_data));
+    // ── 1. Decode JPEG → BGR cv::Mat ─────────────────────────────────────
+    cv::Mat jpeg_buf(1, static_cast<int>(jpeg_size), CV_8UC1,
+                     const_cast<uint8_t*>(payload.data() + 8));
+    cv::Mat bgr = cv::imdecode(jpeg_buf, cv::IMREAD_COLOR);
 
-    // ── 2. Apply brightness ×3.5 and convert BGRA → BGR8 ────────────────
-    // Split channels, scale BGR only (preserve no alpha in output)
-    cv::Mat bgr;
-    cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+    if (bgr.empty() ||
+        bgr.cols != static_cast<int>(width) ||
+        bgr.rows != static_cast<int>(height)) {
+        return;
+    }
 
-    // Brightness scale: multiply all channels by 3.5, clamp to [0, 255]
-    cv::convertScaleAbs(bgr, bgr, BRIGHTNESS_SCALE, 0.0);
-
-    // ── 3. Build ROS 2 Image message via cv_bridge ───────────────────────
+    // ── 2. Build ROS 2 Image message (brightness already applied by reader) ─
     auto stamp = wallClockStamp();
 
     std_msgs::msg::Header header_msg;
@@ -138,7 +134,7 @@ void ZedCameraPublisher::onTcpDataReceived(const PacketHeader& /*header*/,
 
     PROF_PUB_T4();
 
-    // ── 4. Publish Image + CameraInfo ────────────────────────────────────
+    // ── 3. Publish Image + CameraInfo ────────────────────────────────────
     camera_info_.header.stamp = stamp;
     pub_img_->publish(*img_msg);
     pub_info_->publish(camera_info_);

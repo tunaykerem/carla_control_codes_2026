@@ -174,13 +174,19 @@ class OusterLidar:
 
         world = parent_actor.get_world()
         bp = world.get_blueprint_library().find('sensor.lidar.ray_cast')
-        bp.set_attribute('channels',          '64')      # 64→32 hız için
+        bp.set_attribute('channels',          '64')
         bp.set_attribute('range',             '50')
-        bp.set_attribute('points_per_second', '655360')   # minimal
+        bp.set_attribute('points_per_second', '655360')
         bp.set_attribute('rotation_frequency','20')
         bp.set_attribute('upper_fov',         '22.5')
         bp.set_attribute('lower_fov',         '-22.5')
         bp.set_attribute('horizontal_fov',    '360')
+        bp.set_attribute('atmosphere_attenuation_rate', '0.0')
+        bp.set_attribute('sensor_tick',       '0.05')   # 20 Hz callback
+        bp.set_attribute('dropoff_general_rate',    '0.0')  # default=0.45 → 45% loss!
+        bp.set_attribute('dropoff_zero_intensity',  '0.0')  # default=0.40
+        bp.set_attribute('dropoff_intensity_limit', '1.0')  # default=0.80; 1.0 → no drop
+        bp.set_attribute('noise_stddev',            '0.03')
 
         tf = urdf_to_carla_transform(TRANSFORMS['ouster'])
         self.sensor = world.spawn_actor(
